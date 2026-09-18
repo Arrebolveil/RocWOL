@@ -113,12 +113,11 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		protocol.Fail(w, 404, "not_found")
 		return
 	}
-	cookie, e := r.Cookie("__Host-roc_session")
-	if e != nil {
-		g.page(w, "unauthorized.html", http.StatusUnauthorized)
-		return
+	var session string
+	if cookie, err := r.Cookie("__Host-roc_session"); err == nil {
+		session = cookie.Value
 	}
-	ctx, release, e := g.Auth.ProxyContext(r.Context(), cookie.Value, origin)
+	ctx, release, e := g.Auth.ProxyContext(r.Context(), session, origin)
 	if e != nil {
 		g.page(w, "unauthorized.html", http.StatusUnauthorized)
 		return
@@ -263,7 +262,7 @@ func (g *Gateway) api(w http.ResponseWriter, r *http.Request, origin string) {
 		protocol.JSON(w, 200, map[string]string{"redirect": "/cgi-bin/luci/"})
 		return
 	}
-	known := p == "/_wol/v1/target" && r.Method == "GET" || p == "/_wol/v1/wake" && r.Method == "POST" || strings.HasPrefix(p, "/_wol/v1/wake/") && r.Method == "GET" || p == "/_wol/v1/manage/challenge" && r.Method == "POST" || p == "/_wol/v1/manage/ticket" && r.Method == "POST" || p == "/_wol/v1/manage/end" && r.Method == "POST"
+	known := p == "/_wol/v1/target" && r.Method == "GET" || p == "/_wol/v1/wake" && r.Method == "POST" || strings.HasPrefix(p, "/_wol/v1/wake/") && r.Method == "GET" || p == "/_wol/v1/manage/challenge" && r.Method == "POST" || p == "/_wol/v1/manage/authorize" && r.Method == "POST" || p == "/_wol/v1/manage/browser" && r.Method == "POST" || p == "/_wol/v1/manage/status" && r.Method == "GET" || p == "/_wol/v1/manage/end" && r.Method == "POST"
 	if !known {
 		protocol.Fail(w, 404, "not_found")
 		return
@@ -282,6 +281,9 @@ func (g *Gateway) api(w http.ResponseWriter, r *http.Request, origin string) {
 	r = r.WithContext(ctx)
 	switch {
 	case p == "/_wol/v1/manage/end" && r.Method == "POST":
+		if !body(w, r, &struct{}{}) {
+			return
+		}
 		if e := g.Auth.EndManagement(device); e != nil {
 			respondError(w, e)
 			return
@@ -311,23 +313,28 @@ func (g *Gateway) api(w http.ResponseWriter, r *http.Request, origin string) {
 		g.wake(w, r, device, id, false)
 	case p == "/_wol/v1/manage/challenge" && r.Method == "POST":
 		var v struct {
-			Origin         string `json:"origin"`
-			SessionMinutes int    `json:"sessionMinutes"`
+			Origin          string `json:"origin"`
+			SessionMinutes  *int   `json:"sessionMinutes"`
+			AllowAllDevices *bool  `json:"allowAllDevices"`
 		}
 		if !body(w, r, &v) {
+			return
+		}
+		if v.SessionMinutes == nil || v.AllowAllDevices == nil {
+			protocol.Fail(w, 400, "invalid_request")
 			return
 		}
 		if v.Origin != origin {
 			protocol.Fail(w, 403, "forbidden")
 			return
 		}
-		result, e := g.Auth.ManageChallenge(device, origin, v.SessionMinutes)
+		result, e := g.Auth.ManageChallenge(device, origin, *v.SessionMinutes, *v.AllowAllDevices)
 		if e != nil {
 			respondError(w, e)
 			return
 		}
 		protocol.JSON(w, 200, result)
-	case p == "/_wol/v1/manage/ticket" && r.Method == "POST":
+	case p == "/_wol/v1/manage/authorize" && r.Method == "POST":
 		var v struct {
 			ChallengeID string `json:"challengeId"`
 			Signature   string `json:"signature"`
@@ -335,12 +342,37 @@ func (g *Gateway) api(w http.ResponseWriter, r *http.Request, origin string) {
 		if !body(w, r, &v) {
 			return
 		}
-		ticket, expires, e := g.Auth.ManageTicket(device, v.ChallengeID, v.Signature, origin)
+		if !protocol.ValidID(v.ChallengeID) || v.Signature == "" {
+			protocol.Fail(w, 400, "invalid_request")
+			return
+		}
+		result, e := g.Auth.AuthorizeManagement(device, v.ChallengeID, v.Signature, origin)
 		if e != nil {
 			respondError(w, e)
 			return
 		}
-		protocol.JSON(w, 200, map[string]any{"url": origin + "/_wol/manage#t=" + ticket, "expiresAt": expires})
+		protocol.JSON(w, 200, result)
+	case p == "/_wol/v1/manage/status" && r.Method == "GET":
+		result, e := g.Auth.ManagementStatus(device)
+		if e != nil {
+			respondError(w, e)
+			return
+		}
+		if !result.Active {
+			protocol.JSON(w, 200, map[string]bool{"active": false})
+			return
+		}
+		protocol.JSON(w, 200, result)
+	case p == "/_wol/v1/manage/browser" && r.Method == "POST":
+		if !body(w, r, &struct{}{}) {
+			return
+		}
+		result, e := g.Auth.ManagementBrowser(device, origin)
+		if e != nil {
+			respondError(w, e)
+			return
+		}
+		protocol.JSON(w, 200, result)
 	default:
 		protocol.Fail(w, 404, "not_found")
 	}

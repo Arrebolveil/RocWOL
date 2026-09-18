@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -81,15 +82,30 @@ func wantFailure(t *testing.T, e error, status int) {
 }
 func ticket(t *testing.T, s *State, k keys, id, origin string) string {
 	t.Helper()
-	c, e := s.ManageChallenge(id, origin, 10)
+	authorize(t, s, k, id, origin, 10, false)
+	return browserTicket(t, s, id, origin)
+}
+
+func authorize(t *testing.T, s *State, k keys, id, origin string, minutes int, all bool) protocol.ManagementAuthorization {
+	t.Helper()
+	c, e := s.ManageChallenge(id, origin, minutes, all)
 	if e != nil {
 		t.Fatal(e)
 	}
-	v, _, e := s.ManageTicket(id, c.ChallengeID, sign(t, k.manage, protocol.ManageMessage(id, c.ChallengeID, c.Nonce, origin)), origin)
+	v, e := s.AuthorizeManagement(id, c.ChallengeID, sign(t, k.manage, protocol.ManageMessage(id, c.ChallengeID, c.Nonce, origin, minutes, all)), origin)
 	if e != nil {
 		t.Fatal(e)
 	}
 	return v
+}
+
+func browserTicket(t *testing.T, s *State, id, origin string) string {
+	t.Helper()
+	v, e := s.ManagementBrowser(id, origin)
+	if e != nil {
+		t.Fatal(e)
+	}
+	return strings.TrimPrefix(v.URL, origin+"/_wol/manage#t=")
 }
 
 func TestWakeKeyCannotGrantManagementAndConsumesChallenge(t *testing.T) {
@@ -97,14 +113,14 @@ func TestWakeKeyCannotGrantManagementAndConsumesChallenge(t *testing.T) {
 	k := newKeys(t)
 	creds := pair(t, s, k)
 	origin := "https://wol.hubu.wiki"
-	c, e := s.ManageChallenge(creds.DeviceID, origin, 10)
+	c, e := s.ManageChallenge(creds.DeviceID, origin, 10, false)
 	if e != nil {
 		t.Fatal(e)
 	}
-	msg := protocol.ManageMessage(creds.DeviceID, c.ChallengeID, c.Nonce, origin)
-	_, _, e = s.ManageTicket(creds.DeviceID, c.ChallengeID, sign(t, k.wake, msg), origin)
+	msg := protocol.ManageMessage(creds.DeviceID, c.ChallengeID, c.Nonce, origin, 10, false)
+	_, e = s.AuthorizeManagement(creds.DeviceID, c.ChallengeID, sign(t, k.wake, msg), origin)
 	wantFailure(t, e, 403)
-	_, _, e = s.ManageTicket(creds.DeviceID, c.ChallengeID, sign(t, k.manage, msg), origin)
+	_, e = s.AuthorizeManagement(creds.DeviceID, c.ChallengeID, sign(t, k.manage, msg), origin)
 	wantFailure(t, e, 409)
 }
 func TestPairCodeAndChallengeHaveSingleWinner(t *testing.T) {
@@ -202,8 +218,8 @@ func TestTicketOriginReplayAndSessionReplacement(t *testing.T) {
 	}
 	select {
 	case <-otherCtx.Done():
-		t.Fatal("other origin was cancelled")
 	default:
+		t.Fatal("old authorization on another origin survived replacement")
 	}
 	_, _, e = s.ProxyContext(context.Background(), cookie, a)
 	wantFailure(t, e, 401)
@@ -224,7 +240,7 @@ func TestRevokeInvalidatesEveryGrantAndActiveProxy(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer release()
-	tk := ticket(t, s, k, creds.DeviceID, origin)
+	tk := browserTicket(t, s, creds.DeviceID, origin)
 	c, e := s.AuthChallenge(creds.DeviceID)
 	if e != nil {
 		t.Fatal(e)

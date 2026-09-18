@@ -16,6 +16,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import wiki.hubu.rocwol.data.ApiException
+import wiki.hubu.rocwol.data.ManagementAuthorization
 import wiki.hubu.rocwol.data.NetworkException
 import wiki.hubu.rocwol.data.Repository
 import wiki.hubu.rocwol.data.Target
@@ -23,6 +24,7 @@ import wiki.hubu.rocwol.data.WakeRecord
 import wiki.hubu.rocwol.security.AuthenticationCancelled
 import wiki.hubu.rocwol.security.AuthenticationUnavailable
 import wiki.hubu.rocwol.security.IdentityLost
+import java.time.Duration
 import java.time.Instant
 
  data class ScreenState(
@@ -40,9 +42,12 @@ import java.time.Instant
     val waitUntil: Instant? = null,
     val confirmNewWake: Boolean = false,
     val confirmForget: Boolean = false,
-    val managementPending: Boolean = false,
     val sessionMinutes: Int = Repository.DEFAULT_SESSION_MINUTES,
-    val pendingSessionMinutes: Int = Repository.DEFAULT_SESSION_MINUTES
+    val autoOpenBrowser: Boolean = true,
+    val allowAllDevices: Boolean = false,
+    val management: ManagementAuthorization? = null,
+    val managementKnown: Boolean = false,
+    val managementPending: Boolean = false
 )
 
 class WolViewModel(application: Application) : AndroidViewModel(application) {
@@ -50,24 +55,25 @@ class WolViewModel(application: Application) : AndroidViewModel(application) {
     private val mutable = MutableStateFlow(ScreenState(
         paired = repository.deviceId != null, deviceName = repository.displayName,
         origin = repository.origin, wake = repository.rememberedWake(), managementPending = repository.managementPending,
-        sessionMinutes = repository.sessionMinutes, pendingSessionMinutes = repository.pendingSessionMinutes
+        sessionMinutes = repository.sessionMinutes, autoOpenBrowser = repository.autoOpenBrowser,
+        allowAllDevices = repository.allowAllDevices, management = repository.management
     ).let { it.copy(resultText = it.wake?.let(::resultLabel) ?: "尚无唤醒请求") })
     val state = mutable.asStateFlow()
     private var foreground = false
     private var poll: Job? = null
     private var operation: Job? = null
-    private var endOnReturn = repository.managementPending
+    private var managementExpiry: Job? = null
+    private var managementRefreshRequested = false
 
     fun foreground(value: Boolean) {
         foreground = value
         if (!value) {
             poll?.cancel(); poll = null
-            if (repository.managementPending) endOnReturn = true
             return
         }
-        if (!state.value.paired || state.value.busy) return
-        if (endOnReturn) endManagement()
-        else if (state.value.waiting) startPolling() else refresh()
+        if (!state.value.paired) return
+        managementRefreshRequested = true
+        if (!state.value.busy) refresh()
     }
     fun dismissMessage() { mutable.update { it.copy(message = null) } }
     fun dismissConfirmation() { mutable.update { it.copy(confirmNewWake = false, confirmForget = false) } }
@@ -75,21 +81,37 @@ class WolViewModel(application: Application) : AndroidViewModel(application) {
     fun forget() = runOperation {
         repository.endManagement()
         repository.forgetIdentity()
-        mutable.update { ScreenState(origin = repository.origin, sessionMinutes = repository.sessionMinutes, message = "本机身份已清除；服务器上的旧设备仍需通过 CLI 撤销。") }
+        mutable.update { ScreenState(origin = repository.origin, sessionMinutes = repository.sessionMinutes,
+            autoOpenBrowser = repository.autoOpenBrowser, allowAllDevices = repository.allowAllDevices,
+            message = "本机身份已清除；服务器上的旧设备仍需通过 CLI 撤销。") }
     }
     fun pair(activity: Activity, code: String, name: String) = runOperation {
         repository.pair(activity, code.trim().uppercase(), name.trim())
         mutable.update { it.copy(paired = true, deviceName = name.trim(), message = "配对成功", server = "可达") }
         loadTarget()
+        loadManagement()
     }
-    fun refresh() = runOperation { loadTarget() }
+    fun refresh() = runOperation {
+        try { loadManagement() }
+        catch (e: CancellationException) { throw e }
+        catch (e: Exception) { handleError(e) }
+        if (state.value.paired) loadTarget()
+    }
+
+    fun refreshManagement() {
+        if (!state.value.paired) return
+        runOperation { loadManagement() }
+    }
     fun selectOrigin(origin: String) {
         if (state.value.busy || origin == state.value.origin) return
         runOperation {
-            repository.endManagement()
+            if (state.value.paired) repository.endManagement()
             repository.selectOrigin(origin)
             mutable.update { it.copy(origin = origin, target = null, server = "尚未检测", waiting = false, waitUntil = null, message = "线路已手动切换，不会自动重发唤醒请求。") }
-            if (state.value.paired) loadTarget()
+            if (state.value.paired) {
+                loadManagement()
+                loadTarget()
+            }
         }
     }
     fun selectSessionMinutes(minutes: Int) {
@@ -97,6 +119,20 @@ class WolViewModel(application: Application) : AndroidViewModel(application) {
         runOperation {
             repository.selectSessionMinutes(minutes)
             mutable.update { it.copy(sessionMinutes = repository.sessionMinutes) }
+        }
+    }
+    fun setAutoOpenBrowser(value: Boolean) {
+        if (state.value.busy || value == state.value.autoOpenBrowser) return
+        runOperation {
+            repository.setAutoOpenBrowser(value)
+            mutable.update { it.copy(autoOpenBrowser = repository.autoOpenBrowser) }
+        }
+    }
+    fun setAllowAllDevices(value: Boolean) {
+        if (state.value.busy || value == state.value.allowAllDevices) return
+        runOperation {
+            repository.setAllowAllDevices(value)
+            mutable.update { it.copy(allowAllDevices = repository.allowAllDevices) }
         }
     }
     fun requestWake() {
@@ -134,25 +170,53 @@ class WolViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
     }
-    fun manage(activity: Activity) = runOperation {
-        repository.endManagement()
-        endOnReturn = false
-        val url = repository.management(activity)
-        mutable.update { it.copy(managementPending = true, pendingSessionMinutes = repository.pendingSessionMinutes) }
+    fun authorizeManagement(activity: Activity) = runOperation {
+        val openBrowser = state.value.autoOpenBrowser
+        val granted = repository.authorizeManagement(activity)
+        publishManagement()
+        mutable.update { it.copy(message = "已授权管理 ${granted.sessionMinutes} 分钟；返回 App 不会取消授权。") }
+        if (openBrowser) launchManagementBrowser(activity)
+    }
+    fun openManagement(activity: Activity) = runOperation {
+        launchManagementBrowser(activity)
+    }
+    private suspend fun launchManagementBrowser(activity: Activity) {
+        val url = repository.managementBrowserUrl()
+        publishManagement()
         try {
             activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).addCategory(Intent.CATEGORY_BROWSABLE))
         } catch (_: ActivityNotFoundException) {
-            repository.endManagement()
-            mutable.update { it.copy(message = "未找到可用浏览器。管理授权已撤销，请安装浏览器后重试。") }
+            mutable.update { it.copy(message = "未找到可用浏览器，管理授权没有取消。安装浏览器后可再次打开；授权仍按原时间到期，也可手动取消。") }
         } catch (_: SecurityException) {
-            repository.endManagement()
-            mutable.update { it.copy(message = "系统阻止打开浏览器。管理授权已撤销，请检查浏览器设置。") }
+            mutable.update { it.copy(message = "系统阻止打开浏览器，管理授权没有取消。检查浏览器设置后可再次打开，也可手动取消。") }
         }
     }
     fun endManagement() = runOperation {
-        endOnReturn = false
         repository.endManagement()
-        mutable.update { it.copy(message = "管理授权已结束，浏览器再次访问需重新认证。") }
+        publishManagement()
+        mutable.update { it.copy(message = "已取消授权，浏览器再次访问需重新授权；唤醒功能不受影响。") }
+    }
+    private suspend fun loadManagement() {
+        managementRefreshRequested = false
+        try { repository.managementStatus() }
+        finally { publishManagement() }
+    }
+    private fun publishManagement() {
+        val granted = repository.management
+        mutable.update { it.copy(management = granted, managementKnown = repository.managementKnown,
+            managementPending = repository.managementPending) }
+        managementExpiry?.cancel()
+        managementExpiry = granted?.let { authorization ->
+            viewModelScope.launch {
+                delay(Duration.between(Instant.now(), authorization.expiresAt).toMillis().coerceAtLeast(1))
+                // Reaching the cached server deadline is not confirmation of a successful server revocation.
+                mutable.update { if (it.management == authorization) it.copy(management = null) else it }
+                if (foreground && state.value.paired) {
+                    managementRefreshRequested = true
+                    if (!state.value.busy) runOperation(clearMessage = false) { loadManagement() }
+                }
+            }
+        }
     }
     private suspend fun dispatch(record: WakeRecord) {
         val wasOnline = state.value.target?.let { it.router == "available" && it.reachability == "reachable" } == true
@@ -220,29 +284,34 @@ class WolViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
     }
-    private fun runOperation(block: suspend () -> Unit) {
+    private fun runOperation(clearMessage: Boolean = true, block: suspend () -> Unit) {
         if (state.value.busy) return
         poll?.cancel()
-        mutable.update { it.copy(busy = true, message = null) }
+        mutable.update { it.copy(busy = true, message = if (clearMessage) null else it.message) }
         operation = viewModelScope.launch {
             try { block() }
             catch (e: CancellationException) { throw e }
             catch (e: Exception) { handleError(e) }
             finally {
-                mutable.update { it.copy(busy = false, managementPending = repository.managementPending, pendingSessionMinutes = repository.pendingSessionMinutes) }
-                if (foreground && endOnReturn && repository.managementPending) endManagement()
-                else if (foreground && state.value.waiting) startPolling()
+                publishManagement()
+                mutable.update { it.copy(busy = false) }
+                if (foreground && state.value.paired && managementRefreshRequested) {
+                    runOperation(clearMessage = false) { loadManagement() }
+                } else if (foreground && state.value.waiting) startPolling()
             }
         }
     }
     private suspend fun handleError(error: Exception, polling: Boolean = false) {
         if (error is IdentityLost || generateSequence<Throwable>(error) { it.cause }.any { it is KeyPermanentlyInvalidatedException }) {
+            val uncertainManagement = repository.managementPending
             repository.forgetIdentity()
-            mutable.update { it.copy(paired = false, target = null, wake = null, waiting = false, message = "设备身份已撤销、丢失或密钥永久失效，请重新配对。旧服务器记录需通过 CLI 明确撤销。") }
+            mutable.update { it.copy(paired = false, target = null, wake = null, waiting = false,
+                message = "设备身份已撤销、丢失或密钥永久失效，请重新配对。旧服务器记录需通过 CLI 明确撤销。" +
+                    if (uncertainManagement) "尚未确认管理授权已取消，请在服务器撤销旧设备；原授权到期后会自动失效。" else "") }
             return
         }
         val message = when (error) {
-            is AuthenticationCancelled -> "已取消系统认证，没有生成管理票据。"
+            is AuthenticationCancelled -> "已取消系统认证，没有提交新的管理授权；已有授权不受影响。"
             is AuthenticationUnavailable -> "此设备无法完成逐次 CryptoObject 管理签名。需要 Android 11 及以上、安全锁屏与可用的强生物识别或锁屏凭据；不会降级管理密钥。"
             is ApiException -> when (error.code) {
                 "unauthorized" -> "认证已失效，请再次操作以重新认证。配对时请检查配对码。"
@@ -252,16 +321,22 @@ class WolViewModel(application: Application) : AndroidViewModel(application) {
                 "upstream_unavailable" -> "服务器可达，但路由器链路不可用；无法判断电脑是否关机。"
                 "non_json_response" -> "线路返回了非 API 页面。备用线路可能被 Cloudflare 边缘验证阻止，请手动选择直连。"
                 "redirect_refused" -> "服务返回了重定向，已拒绝跟随；请检查当前线路。"
+                "invalid_response" -> "服务响应无效，未确认本次操作的服务器结果，请刷新状态或重试。"
+                "management_inactive" -> "当前没有有效的管理授权，请先进行系统认证并授权。"
                 "invalid_request" -> "请求未被接受，请检查配对码和设备名称。"
                 "not_found" -> "未找到请求或设备。"
                 else -> "服务暂时无法完成操作，请稍后重试。"
             }
             is NetworkException -> "无法连接当前线路（网络或受信 TLS 连接失败）。未自动切换线路或重发请求。"
-            is IllegalArgumentException -> "输入或服务响应无效。配对码应为 32 位，设备名称最多 64 个字符。"
-            else -> "操作未完成，请重试。若配对提交时断网，请在服务器检查设备记录后重新签发配对码。"
+            is IllegalArgumentException -> "输入或服务响应无效，请检查输入并刷新状态；配对码应为 32 位，设备名称最多 64 个字符。"
+            else -> "操作未完成，请刷新状态后重试。若配对提交时断网，请在服务器检查设备记录后重新签发配对码。"
         }
         mutable.update {
-            it.copy(message = (if (repository.managementPending) "管理授权尚未确认撤销，请点击“结束管理授权”重试。本次授权 ${repository.pendingSessionMinutes} 分钟；即使离线，也会在票据签发后最多 ${repository.pendingSessionMinutes + 1} 分钟内失效（含最多 1 分钟的票据兑换等待）。\n" else "") + (if (polling && it.message != null) it.message else message),
+            it.copy(message = (if (repository.managementPending && !repository.managementKnown)
+                "管理授权状态尚未确认，请刷新状态或点击“取消授权”向服务器关闭；不会因网络错误或返回 App 自动取消。\n"
+                else if (repository.management != null)
+                    "本次操作不会自动取消已确认的管理授权；可手动取消或刷新状态。\n"
+                else "") + (if (polling && it.message != null) it.message else message),
                 server = if (error is NetworkException) "不可达" else if (error is ApiException) "可达" else it.server,
                 target = if (error is NetworkException || (error is ApiException && error.status >= 500)) null else it.target)
         }

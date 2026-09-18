@@ -25,12 +25,16 @@ func fail(status int, code string) error { return &Failure{status, code} }
 type challenge struct {
 	protocol.Challenge
 	Kind, Device, Origin, CodeHash, Name, Wake, Manage string
-	SessionTTL                                         time.Duration
+	SessionMinutes                                     int
+	AllowAllDevices                                    bool
 }
 type grant struct {
-	Device, Origin string
-	Expires        time.Time
-	SessionTTL     time.Duration
+	Device, Origin, Authorization string
+	Expires                       time.Time
+}
+type managementGrant struct {
+	protocol.ManagementAuthorization
+	Key string
 }
 type window struct {
 	Start time.Time
@@ -41,6 +45,7 @@ type State struct {
 	db                        *store.Store
 	challenges                map[string]challenge
 	tokens, tickets, sessions map[string]grant
+	management                map[string]managementGrant
 	rates                     map[string]window
 	active                    map[string]map[string]context.CancelFunc
 	now                       func() time.Time
@@ -48,10 +53,15 @@ type State struct {
 }
 
 func New(db *store.Store) *State {
-	return &State{db: db, challenges: map[string]challenge{}, tokens: map[string]grant{}, tickets: map[string]grant{}, sessions: map[string]grant{}, rates: map[string]window{}, active: map[string]map[string]context.CancelFunc{}, now: func() time.Time { return time.Now().UTC() }, MaxSessionTTL: 30 * time.Minute}
+	return &State{db: db, challenges: map[string]challenge{}, tokens: map[string]grant{}, tickets: map[string]grant{}, sessions: map[string]grant{}, management: map[string]managementGrant{}, rates: map[string]window{}, active: map[string]map[string]context.CancelFunc{}, now: func() time.Time { return time.Now().UTC() }, MaxSessionTTL: 30 * time.Minute}
 }
 func (s *State) clean() {
 	now := s.now()
+	for device, g := range s.management {
+		if !g.ExpiresAt.After(now) {
+			s.closeManagement(device)
+		}
+	}
 	for k, v := range s.challenges {
 		if !v.ExpiresAt.After(now) {
 			delete(s.challenges, k)
@@ -61,6 +71,7 @@ func (s *State) clean() {
 		for k, v := range m {
 			if !v.Expires.After(now) {
 				delete(m, k)
+				s.cancelSession(k)
 			}
 		}
 	}
@@ -253,7 +264,7 @@ func (s *State) TokenContext(parent context.Context, token string) (context.Cont
 	ctx, release := s.grantContext(parent, key, g)
 	return ctx, g.Device, release, nil
 }
-func (s *State) ManageChallenge(device, origin string, sessionMinutes int) (protocol.Challenge, error) {
+func (s *State) ManageChallenge(device, origin string, sessionMinutes int, allowAllDevices bool) (protocol.Challenge, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if sessionMinutes != 5 && sessionMinutes != 10 && sessionMinutes != 15 && sessionMinutes != 30 {
@@ -265,28 +276,78 @@ func (s *State) ManageChallenge(device, origin string, sessionMinutes int) (prot
 	if _, e := s.validDevice(device); e != nil {
 		return protocol.Challenge{}, e
 	}
-	// The signed challenge ID/nonce binds this immutable duration; ticket and
-	// redemption requests cannot select a different lifetime.
-	return s.newChallenge(challenge{Kind: "manage", Device: device, Origin: origin, SessionTTL: time.Duration(sessionMinutes) * time.Minute}, time.Minute), nil
+	return s.newChallenge(challenge{Kind: "manage", Device: device, Origin: origin, SessionMinutes: sessionMinutes, AllowAllDevices: allowAllDevices}, time.Minute), nil
 }
-func (s *State) ManageTicket(device, id, sig, origin string) (string, time.Time, error) {
+
+func (s *State) AuthorizeManagement(device, id, sig, origin string) (protocol.ManagementAuthorization, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.clean()
 	c, e := s.consume(id, "manage", device)
 	if e != nil {
-		return "", time.Time{}, e
+		return protocol.ManagementAuthorization{}, e
 	}
 	d, e := s.validDevice(device)
 	if e != nil {
-		return "", time.Time{}, e
+		return protocol.ManagementAuthorization{}, e
 	}
-	if c.Origin != origin || !protocol.Verify(d.ManageKey, sig, protocol.ManageMessage(device, id, c.Nonce, c.Origin)) {
-		return "", time.Time{}, fail(403, "forbidden")
+	if c.Origin != origin || !protocol.Verify(d.ManageKey, sig, protocol.ManageMessage(device, id, c.Nonce, c.Origin, c.SessionMinutes, c.AllowAllDevices)) {
+		return protocol.ManagementAuthorization{}, fail(403, "forbidden")
+	}
+	s.closeManagement(device)
+	s.clearManageChallenges(device)
+	g := managementGrant{
+		ManagementAuthorization: protocol.ManagementAuthorization{
+			Active: true, Origin: origin, SessionMinutes: c.SessionMinutes, AllowAllDevices: c.AllowAllDevices,
+			ExpiresAt: s.now().Add(min(time.Duration(c.SessionMinutes)*time.Minute, s.MaxSessionTTL, 30*time.Minute)),
+		},
+		Key: "manage:" + protocol.Random(32),
+	}
+	s.management[device] = g
+	return g.ManagementAuthorization, nil
+}
+
+func (s *State) ManagementStatus(device string) (protocol.ManagementAuthorization, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.clean()
+	if _, e := s.validDevice(device); e != nil {
+		return protocol.ManagementAuthorization{}, e
+	}
+	return s.management[device].ManagementAuthorization, nil
+}
+
+func (s *State) ManagementBrowser(device, origin string) (protocol.ManagementBrowser, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.clean()
+	if _, e := s.validDevice(device); e != nil {
+		return protocol.ManagementBrowser{}, e
+	}
+	g, ok := s.management[device]
+	if !ok || g.Origin != origin {
+		return protocol.ManagementBrowser{}, fail(403, "forbidden")
+	}
+	if !s.rate("browser:global", 60) || !s.rate("browser:"+device, 10) {
+		return protocol.ManagementBrowser{}, fail(429, "rate_limited")
+	}
+	// One outstanding ticket per device bounds allocation and invalidates stale links.
+	for key, old := range s.tickets {
+		if old.Device == device {
+			delete(s.tickets, key)
+		}
 	}
 	ticket := protocol.Random(32)
-	expires := s.now().Add(time.Minute)
-	s.tickets[protocol.Hash(ticket)] = grant{Device: device, Origin: origin, Expires: expires, SessionTTL: c.SessionTTL}
-	return ticket, expires, nil
+	expires := minTime(s.now().Add(time.Minute), g.ExpiresAt)
+	s.tickets[protocol.Hash(ticket)] = grant{Device: device, Origin: origin, Authorization: g.Key, Expires: expires}
+	return protocol.ManagementBrowser{URL: origin + "/_wol/manage#t=" + ticket, ExpiresAt: expires, AuthorizationExpiresAt: g.ExpiresAt}, nil
+}
+
+func minTime(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
+	}
+	return b
 }
 func (s *State) Redeem(ticket, origin string) (string, time.Time, error) {
 	s.mu.Lock()
@@ -304,6 +365,10 @@ func (s *State) Redeem(ticket, origin string) (string, time.Time, error) {
 	if _, e := s.validDevice(g.Device); e != nil {
 		return "", time.Time{}, e
 	}
+	authorization, ok := s.management[g.Device]
+	if !ok || authorization.Key != g.Authorization || authorization.Origin != origin {
+		return "", time.Time{}, fail(401, "unauthorized")
+	}
 	for k, old := range s.sessions {
 		if old.Device == g.Device && old.Origin == origin {
 			delete(s.sessions, k)
@@ -311,7 +376,7 @@ func (s *State) Redeem(ticket, origin string) (string, time.Time, error) {
 		}
 	}
 	cookie := protocol.Random(32)
-	g.Expires = s.now().Add(min(g.SessionTTL, s.MaxSessionTTL))
+	g.Expires = authorization.ExpiresAt
 	s.sessions[protocol.Hash(cookie)] = g
 	return cookie, g.Expires, nil
 }
@@ -322,20 +387,42 @@ func (s *State) cancelSession(key string) {
 	delete(s.active, key)
 }
 
-// ProxyContext checks and registers atomically with revocation so a revoked
-// device cannot create a new untracked request after the initial cookie check.
+// ProxyContext admits cookie or explicitly authorized anonymous access while
+// holding the same lock used by expiry, replacement and owner revocation.
 func (s *State) ProxyContext(parent context.Context, cookie, origin string) (context.Context, func(), error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.clean()
 	key := protocol.Hash(cookie)
 	g, ok := s.sessions[key]
-	if !ok || g.Origin != origin || !g.Expires.After(s.now()) {
+	if ok && g.Origin == origin && g.Expires.After(s.now()) {
+		authorization, exists := s.management[g.Device]
+		if exists && authorization.Key == g.Authorization && authorization.Origin == origin {
+			if _, e := s.validDevice(g.Device); e == nil {
+				ctx, release := s.grantContext(parent, key, g)
+				return ctx, release, nil
+			}
+		}
+	}
+	// Multiple owners may authorize this origin. Attribute each admitted request
+	// to one owner, preferring the earliest expiry, so cancellation is scoped.
+	var owner string
+	var selected managementGrant
+	for device, authorization := range s.management {
+		if authorization.Origin != origin || !authorization.AllowAllDevices {
+			continue
+		}
+		if _, e := s.validDevice(device); e != nil {
+			continue
+		}
+		if owner == "" || authorization.ExpiresAt.Before(selected.ExpiresAt) || authorization.ExpiresAt.Equal(selected.ExpiresAt) && device < owner {
+			owner, selected = device, authorization
+		}
+	}
+	if owner == "" {
 		return nil, nil, fail(401, "unauthorized")
 	}
-	if _, e := s.validDevice(g.Device); e != nil {
-		return nil, nil, e
-	}
-	ctx, release := s.grantContext(parent, key, g)
+	ctx, release := s.grantContext(parent, selected.Key, grant{Device: owner, Origin: origin, Expires: selected.ExpiresAt})
 	return ctx, release, nil
 }
 
@@ -358,18 +445,11 @@ func (s *State) grantContext(parent context.Context, key string, g grant) (conte
 	}
 }
 
-// EndManagement closes only this device's management grants, across both origins.
-// Wake credentials stay valid; pending challenges cannot reopen a closed session.
-func (s *State) EndManagement(device string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, err := s.validDevice(device); err != nil {
-		return err
-	}
-	for key, c := range s.challenges {
-		if c.Device == device && c.Kind == "manage" {
-			delete(s.challenges, key)
-		}
+// closeManagement requires mu and leaves wake credentials untouched.
+func (s *State) closeManagement(device string) {
+	if g, ok := s.management[device]; ok {
+		s.cancelSession(g.Key)
+		delete(s.management, device)
 	}
 	for _, grants := range []map[string]grant{s.tickets, s.sessions} {
 		for key, g := range grants {
@@ -379,6 +459,26 @@ func (s *State) EndManagement(device string) error {
 			}
 		}
 	}
+}
+
+func (s *State) clearManageChallenges(device string) {
+	for key, c := range s.challenges {
+		if c.Device == device && c.Kind == "manage" {
+			delete(s.challenges, key)
+		}
+	}
+}
+
+// EndManagement closes this device's authorization, including anonymous streams.
+// Wake credentials stay valid; pending challenges cannot reopen a closed grant.
+func (s *State) EndManagement(device string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.validDevice(device); err != nil {
+		return err
+	}
+	s.clearManageChallenges(device)
+	s.closeManagement(device)
 	return nil
 }
 func (s *State) Revoke(device string) error {
@@ -387,6 +487,7 @@ func (s *State) Revoke(device string) error {
 	if e := s.db.Revoke(device); e != nil {
 		return e
 	}
+	s.closeManagement(device)
 	for k, c := range s.challenges {
 		if c.Device == device {
 			delete(s.challenges, k)
@@ -425,5 +526,6 @@ func (s *State) Close() {
 	clear(s.tokens)
 	clear(s.tickets)
 	clear(s.sessions)
+	clear(s.management)
 	clear(s.challenges)
 }

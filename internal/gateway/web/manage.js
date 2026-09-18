@@ -3,7 +3,7 @@ async function redeem() {
   const fragment = location.hash.slice(1);
   history.replaceState(null, "", location.pathname);
   const status = document.getElementById("status");
-  const fail = () => { status.textContent = "授权已失效，请返回 App 重试"; };
+  const fail = () => { status.textContent = "无法打开管理页面，请返回 App 查看授权状态并重新打开浏览器"; };
   const params = new URLSearchParams(fragment);
   const ticket = params.get("t");
   if (!ticket || !/^[A-Za-z0-9_-]{43}$/.test(ticket) || params.size !== 1) { fail(); return; }

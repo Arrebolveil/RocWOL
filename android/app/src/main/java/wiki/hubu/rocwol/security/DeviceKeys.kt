@@ -69,7 +69,7 @@ class DeviceKeys {
         signature.update(message.toByteArray(Charsets.UTF_8))
         encode(signature.sign())
     }
-    suspend fun signManagement(activity: Activity, message: String, sessionMinutes: Int?): String {
+    suspend fun signManagement(activity: Activity, message: String, sessionMinutes: Int?, allowAllDevices: Boolean): String {
         val signature = withContext(Dispatchers.IO) {
             try { signer(MANAGE) }
             catch (e: java.security.GeneralSecurityException) { throw AuthenticationUnavailable(e) }
@@ -81,7 +81,16 @@ class DeviceKeys {
                 try {
                     val prompt = BiometricPrompt.Builder(activity)
                         .setTitle(if (sessionMinutes == null) "授权此手机" else "授权路由器管理")
-                        .setSubtitle(if (sessionMinutes == null) "验证管理密钥后才能完成双密钥配对" else "签名授权浏览器访问 $sessionMinutes 分钟；返回 App 时撤销")
+                        .setSubtitle(when {
+                            sessionMinutes == null -> "验证管理密钥后才能完成双密钥配对"
+                            allowAllDevices -> "允许所有设备访问当前线路，授权 $sessionMinutes 分钟"
+                            else -> "仅授权本机打开的浏览器，授权 $sessionMinutes 分钟"
+                        })
+                        .setDescription(when {
+                            sessionMinutes == null -> "此认证用于注册管理密钥，不会开启路由器管理授权。"
+                            allowAllDevices -> "授权期间，任何设备均可通过当前线路访问 LuCI 登录页，仍需 LuCI 登录。返回 App 不会取消授权；到期自动失效，也可在 App 手动取消。"
+                            else -> "授权从本次签名被服务器接受时开始，仍需 LuCI 登录。返回 App 不会取消授权；到期自动失效，也可在 App 手动取消。"
+                        })
                         .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG or BiometricManager.Authenticators.DEVICE_CREDENTIAL)
                         .build()
                     prompt.authenticate(BiometricPrompt.CryptoObject(signature), cancellation, activity.mainExecutor,

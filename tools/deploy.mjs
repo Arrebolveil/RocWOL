@@ -562,70 +562,131 @@ async function protocolSmoke(server, config, host) {
     const token = tokenReply.body.accessToken;
     const target = await api(origin, 'target', null, token);
     must(target.status === 200 && target.body.targetId === 'desktop' && target.body.router === 'available', 'Authenticated target cannot reach private agent');
-    const management = await api(origin, 'manage/challenge', { origin, sessionMinutes: 10 }, token);
-    must(management.status === 200, 'Management challenge failed');
-    const mc = management.body;
-    const ticketPayload = { challengeId: mc.challengeId, signature: sign(manage.privateKey, `ROCWOL-MANAGE-V1\nroc-wol\n${deviceId}\n${mc.challengeId}\n${mc.nonce}\n${origin}`) };
-    const ticketOverride = await api(origin, 'manage/ticket', { ...ticketPayload, sessionMinutes: 30 }, token);
-    must(ticketOverride.status === 400, 'Management ticket accepted a duration override');
-    const ticket = await api(origin, 'manage/ticket', ticketPayload, token);
-    must(ticket.status === 200, 'Independent management signing failed');
-    const ticketURL = new URL(ticket.body.url);
-    must(ticketURL.origin === origin && ticketURL.pathname === '/_wol/manage' && !ticketURL.search, 'Management ticket origin/path mismatch');
-    const opaque = new URLSearchParams(ticketURL.hash.slice(1)).get('t');
+    const otherHost = host === config.directHost ? config.fallbackHost : config.directHost;
+    const canonical = (challenge, sessionMinutes, allowAllDevices, selectedOrigin = origin) =>
+      ['ROCWOL-MANAGE-V2', 'roc-wol', deviceId, challenge.challengeId, challenge.nonce, selectedOrigin, String(sessionMinutes), allowAllDevices ? 'all-devices' : 'browser-only'].join('\n');
+    const statusMatches = async grant => {
+      const status = await api(origin, 'manage/status', null, token);
+      must(status.status === 200 && status.body.active === true && status.body.expiresAt === grant.expiresAt &&
+        status.body.sessionMinutes === grant.sessionMinutes && status.body.allowAllDevices === grant.allowAllDevices &&
+        status.body.origin === origin, 'Management status changed the authorization scope or expiry');
+    };
+    const authorize = async (sessionMinutes, allowAllDevices) => {
+      const management = await api(origin, 'manage/challenge', { origin, sessionMinutes, allowAllDevices }, token);
+      must(management.status === 200, `${sessionMinutes}-minute management challenge failed`);
+      const payload = { challengeId: management.body.challengeId, signature: sign(manage.privateKey, canonical(management.body, sessionMinutes, allowAllDevices)) };
+      const override = await api(origin, 'manage/authorize', { ...payload, sessionMinutes: 30 }, token);
+      must(override.status === 400, 'Management authorization accepted a duration override');
+      const authorized = await api(origin, 'manage/authorize', payload, token);
+      const remaining = Date.parse(authorized.body.expiresAt) - Date.parse(authorized.headers.date);
+      must(authorized.status === 200 && authorized.body.active === true &&
+        authorized.body.sessionMinutes === sessionMinutes && authorized.body.allowAllDevices === allowAllDevices &&
+        authorized.body.origin === origin && remaining > 0 && remaining <= sessionMinutes * 60000 + 1000,
+      'Hardware signature did not establish the selected bounded authorization');
+      await statusMatches(authorized.body); // Active before requesting or redeeming any browser ticket.
+      return authorized.body;
+    };
+    const browserTicket = async grant => {
+      const ticket = await api(origin, 'manage/browser', {}, token);
+      must(ticket.status === 200 && ticket.body.authorizationExpiresAt === grant.expiresAt, 'Browser ticket changed authorization expiry');
+      const ticketExpiry = Date.parse(ticket.body.expiresAt);
+      must(ticketExpiry <= Date.parse(grant.expiresAt) && ticketExpiry > Date.parse(ticket.headers.date) &&
+        ticketExpiry <= Date.parse(ticket.headers.date) + 61000, 'Browser ticket exceeds one minute or its authorization');
+      const url = new URL(ticket.body.url);
+      must(url.origin === origin && url.pathname === '/_wol/manage' && !url.search, 'Management ticket origin/path mismatch');
+      const params = new URLSearchParams(url.hash.slice(1));
+      must(params.size === 1 && /^[A-Za-z0-9_-]{43}$/.test(params.get('t') || ''), 'Management browser ticket is malformed');
+      await statusMatches(grant);
+      return params.get('t');
+    };
+    const redeem = async (ticket, grant) => {
+      const redeemed = await api(origin, 'manage/redeem', { ticket });
+      must(redeemed.status === 200 && redeemed.body.redirect === '/cgi-bin/luci/', 'Management ticket redemption failed');
+      const cookieHeader = (redeemed.headers['set-cookie'] || []).find(value => value.startsWith('__Host-roc_session='));
+      must(cookieHeader && /;\s*Secure/i.test(cookieHeader) && /;\s*HttpOnly/i.test(cookieHeader) &&
+        /;\s*SameSite=Strict/i.test(cookieHeader) && !/;\s*Domain=/i.test(cookieHeader), 'Management session cookie constraints failed');
+      const maxAge = Number(cookieHeader.match(/;\s*Max-Age=(\d+)/i)?.[1]);
+      const cookieExpiry = Date.parse(redeemed.headers.date) + maxAge * 1000;
+      must(maxAge > 0 && Math.abs(cookieExpiry - Date.parse(grant.expiresAt)) <= 2000, 'Browser cookie did not inherit existing authorization expiry');
+      await statusMatches(grant);
+      return cookieHeader.split(';')[0];
+    };
+    const reachesLogin = panel => {
+      // No LuCI credentials are supplied: a real login form must remain, not merely an HTTP success.
+      return [200, 403].includes(panel.status) && /<form\b/i.test(panel.body) &&
+        /<input\b[^>]*\bname=["']luci_username["']/i.test(panel.body) &&
+        /<input\b[^>]*\bname=["']luci_password["']/i.test(panel.body);
+    };
+    const end = async cookie => {
+      const ended = await api(origin, 'manage/end', {}, token);
+      must(ended.status === 200 && ended.body.ended === true, 'Manual management cancellation failed');
+      const status = await api(origin, 'manage/status', null, token);
+      must(status.status === 200 && status.body.active === false, 'Ended authorization remains active');
+      for (const headers of [{}, { Cookie: cookie }]) {
+        must((await request(`${origin}/cgi-bin/luci/`, { headers })).status === 401, 'Ended authorization still reached LuCI');
+      }
+      must([401, 403].includes((await api(origin, 'manage/browser', {}, token)).status), 'Wake bearer created a browser ticket without active authorization');
+      must((await api(origin, 'target', null, token)).status === 200, 'Ending management revoked wake access');
+      const repeated = await api(origin, 'manage/end', {}, token);
+      must(repeated.status === 200 && repeated.body.ended === true, 'Manual cancellation was not idempotent');
+    };
+    must((await api(origin, 'manage/status', null, token)).body.active === false, 'Fresh device unexpectedly has management authorization');
+    must([401, 403].includes((await api(origin, 'manage/browser', {}, token)).status), 'Wake bearer alone created management access');
+    must((await request(`${origin}/cgi-bin/luci/`)).status === 401, 'Anonymous LuCI access was not denied');
+    const grant = await authorize(10, false);
+    must((await request(`${origin}/cgi-bin/luci/`)).status === 401, 'Browser-only authorization opened anonymous LuCI access');
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    await statusMatches(grant);
+    const opaque = await browserTicket(grant);
     const redeemOverride = await api(origin, 'manage/redeem', { ticket: opaque, sessionMinutes: 30 });
     must(redeemOverride.status === 400, 'Management redemption accepted a duration override');
-    const redeemed = await api(origin, 'manage/redeem', { ticket: opaque });
-    must(redeemed.status === 200 && redeemed.body.redirect === '/cgi-bin/luci/', 'Management ticket redemption failed');
-    const cookieHeaders = redeemed.headers['set-cookie'] || [];
-    const cookieHeader = cookieHeaders.find(value => value.startsWith('__Host-roc_session='));
-    must(cookieHeader && /;\s*Secure/i.test(cookieHeader) && /;\s*HttpOnly/i.test(cookieHeader) && /;\s*SameSite=Strict/i.test(cookieHeader) && !/;\s*Domain=/i.test(cookieHeader), 'Management session cookie constraints failed');
-    const maxAge = Number(cookieHeader.match(/;\s*Max-Age=(\d+)/i)?.[1]);
-    must(maxAge >= 599 && maxAge <= 600, 'Management session does not match ten-minute authorization limit');
-    let cookie = cookieHeader.split(';')[0];
-    const panel = await request(`${origin}/cgi-bin/luci/`, { headers: { Cookie: cookie } });
-    // LuCI returns its own login form with 403 until its separate root login.
-    // Do not confuse that expected response with a gateway/edge denial.
-    const luciLogin = panel.status === 403 && /<form\b/i.test(panel.body) &&
-      /<input\b[^>]*\bname=["']luci_username["']/i.test(panel.body) &&
-      /<input\b[^>]*\bname=["']luci_password["']/i.test(panel.body);
-    must([200, 302, 303].includes(panel.status) || luciLogin, `Authenticated management proxy could not reach LuCI (HTTP ${panel.status})`);
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    let cookie = await redeem(opaque, grant);
+    must(reachesLogin(await request(`${origin}/cgi-bin/luci/`, { headers: { Cookie: cookie } })), 'Authorized browser did not reach separate LuCI login');
     const repeat = await api(origin, 'manage/redeem', { ticket: opaque });
     must(repeat.status === 409 || repeat.status === 401, 'Management ticket replay was accepted');
-    const ended = await api(origin, 'manage/end', {}, token);
-    must(ended.status === 200 && ended.body.ended === true, 'Management revocation failed');
-    const closedPanel = await request(`${origin}/cgi-bin/luci/`, { headers: { Cookie: cookie } });
-    must(closedPanel.status === 401, 'Ended browser session still reached LuCI');
-    must((await api(origin, 'target', null, token)).status === 200, 'Ending management revoked wake access');
-    // At most eight device challenge requests: auth, two 10m, three alternatives, two invalid.
-    // Pairing only consumes the global quota; ticket/redeem overrides do not issue challenges.
+    const pendingTicket = await browserTicket(grant);
+    await end(cookie);
+    must([401, 409].includes((await api(origin, 'manage/redeem', { ticket: pendingTicket })).status), 'Manual cancellation left an unused browser ticket valid');
+    // Ten device challenge attempts total: one wake auth, four grants, three signature
+    // scope-tamper cases and two invalid durations. Pairing uses the separate global quota.
     for (const sessionMinutes of [0, 31]) {
-      const invalid = await api(origin, 'manage/challenge', { origin, sessionMinutes }, token);
+      const invalid = await api(origin, 'manage/challenge', { origin, sessionMinutes, allowAllDevices: false }, token);
       must(invalid.status === 400, `Invalid management duration ${sessionMinutes} was not rejected`);
     }
-    for (const sessionMinutes of [5, 15, 30]) {
-      const durationChallenge = await api(origin, 'manage/challenge', { origin, sessionMinutes }, token);
-      must(durationChallenge.status === 200, `${sessionMinutes}-minute management challenge failed`);
-      const dc = durationChallenge.body;
-      const durationTicket = await api(origin, 'manage/ticket', { challengeId: dc.challengeId, signature: sign(manage.privateKey, `ROCWOL-MANAGE-V1\nroc-wol\n${deviceId}\n${dc.challengeId}\n${dc.nonce}\n${origin}`) }, token);
-      must(durationTicket.status === 200, `${sessionMinutes}-minute management signing failed`);
-      const durationRedeemed = await api(origin, 'manage/redeem', { ticket: new URLSearchParams(new URL(durationTicket.body.url).hash.slice(1)).get('t') });
-      must(durationRedeemed.status === 200, `${sessionMinutes}-minute management redemption failed`);
-      const durationCookie = (durationRedeemed.headers['set-cookie'] || []).find(value => value.startsWith('__Host-roc_session='));
-      const durationMaxAge = Number(durationCookie?.match(/;\s*Max-Age=(\d+)/i)?.[1]);
-      must(durationMaxAge >= sessionMinutes * 60 - 1 && durationMaxAge <= sessionMinutes * 60, `${sessionMinutes}-minute management cookie lifetime mismatch`);
+    for (const [minutes, allDevices, signedOrigin] of [[30, false, origin], [10, true, origin], [10, false, `https://${otherHost}`]]) {
+      const challenge = await api(origin, 'manage/challenge', { origin, sessionMinutes: 10, allowAllDevices: false }, token);
+      must(challenge.status === 200, 'Scope-tamper management challenge failed');
+      const rejected = await api(origin, 'manage/authorize', {
+        challengeId: challenge.body.challengeId,
+        signature: sign(manage.privateKey, canonical(challenge.body, minutes, allDevices, signedOrigin)),
+      }, token);
+      must([401, 403].includes(rejected.status), 'Management signature accepted a changed duration, access scope or origin');
+      const status = await api(origin, 'manage/status', null, token);
+      must(status.status === 200 && status.body.active === false, 'Rejected signature established management authorization');
     }
-    const freshManagement = await api(origin, 'manage/challenge', { origin, sessionMinutes: 10 }, token);
-    must(freshManagement.status === 200, 'Fresh management challenge failed after ending session');
-    const freshChallenge = freshManagement.body;
-    const freshTicket = await api(origin, 'manage/ticket', { challengeId: freshChallenge.challengeId, signature: sign(manage.privateKey, `ROCWOL-MANAGE-V1\nroc-wol\n${deviceId}\n${freshChallenge.challengeId}\n${freshChallenge.nonce}\n${origin}`) }, token);
-    must(freshTicket.status === 200, 'Fresh management authentication failed after ending session');
-    const freshRedeemed = await api(origin, 'manage/redeem', { ticket: new URLSearchParams(new URL(freshTicket.body.url).hash.slice(1)).get('t') });
-    must(freshRedeemed.status === 200, 'Fresh management ticket could not be redeemed');
-    const freshCookie = (freshRedeemed.headers['set-cookie'] || []).find(value => value.startsWith('__Host-roc_session='));
-    const freshMaxAge = Number(freshCookie?.match(/;\s*Max-Age=(\d+)/i)?.[1]);
-    must(freshMaxAge >= 599 && freshMaxAge <= 600, 'Fresh management session does not match ten-minute authorization limit');
-    cookie = freshCookie.split(';')[0];
+    const malformed = await api(origin, 'manage/authorize', { challengeId: 1, signature: false }, token);
+    must(malformed.status === 400, 'Malformed management authorization was accepted');
+    const allGrant = await authorize(30, true);
+    must(reachesLogin(await request(`${origin}/cgi-bin/luci/`)), 'All-device authorization did not retain anonymous separate LuCI login');
+    // Probe the gateway directly on loopback: the alternate public vhost may still
+    // be the legacy route before cutover, which this smoke must never change.
+    const otherHostStatus = await server.exec(`curl --silent --show-error --max-time 10 --noproxy '*' --output /dev/null --write-out '%{http_code}' -H ${quote(`Host: ${otherHost}`)} -H 'X-Forwarded-Proto: https' http://127.0.0.1:${config.gatewayPort}/cgi-bin/luci/`, 'verify all-device authorization is bound to exact host');
+    must(otherHostStatus.trim() === '401', 'All-device authorization leaked onto the other gateway origin');
+    const crossOrigin = await request(`${origin}/ubus`, { headers: { Connection: 'Upgrade', Upgrade: 'websocket', Origin: `https://${otherHost}`, 'Sec-WebSocket-Version': '13', 'Sec-WebSocket-Key': crypto.randomBytes(16).toString('base64') } });
+    must(crossOrigin.status === 403, 'All-device authorization bypassed Origin checks');
+    must((await api(origin, 'target')).status === 401, 'All-device authorization bypassed API authentication');
+    const reserved = await request(`${origin}/_roc-agent/v1/status`);
+    must([403, 404].includes(reserved.status), 'All-device authorization exposed a reserved agent route');
+    cookie = await redeem(await browserTicket(allGrant), allGrant);
+    await end(cookie);
+    const shortGrant = await authorize(5, false);
+    const oldCookie = await redeem(await browserTicket(shortGrant), shortGrant);
+    const oldTicket = await browserTicket(shortGrant);
+    const freshGrant = await authorize(15, false);
+    must((await request(`${origin}/cgi-bin/luci/`, { headers: { Cookie: oldCookie } })).status === 401, 'New authorization retained the previous browser cookie');
+    must([401, 409].includes((await api(origin, 'manage/redeem', { ticket: oldTicket })).status), 'New authorization retained the previous browser ticket');
+    cookie = await redeem(await browserTicket(freshGrant), freshGrant);
     await server.exec(`/opt/roc-wol/bin/roc-wol devices revoke --socket /run/roc-wol/admin.sock --id ${deviceId} >/dev/null`, 'revoke temporary smoke identity');
     const denied = await request(`${origin}/cgi-bin/luci/`, { headers: { Cookie: cookie } });
     must(denied.status === 401, 'Device revocation did not invalidate management session');

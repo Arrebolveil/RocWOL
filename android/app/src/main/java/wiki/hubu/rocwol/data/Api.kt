@@ -89,6 +89,31 @@ data class Challenge(val id: String, val nonce: String, val expiresAt: Instant) 
     }
 }
 
+data class ManagementAuthorization(
+    val expiresAt: Instant,
+    val sessionMinutes: Int,
+    val allowAllDevices: Boolean,
+    val origin: String
+) {
+    fun toJson(): JSONObject = JSONObject().put("active", true).put("expiresAt", expiresAt.toString())
+        .put("sessionMinutes", sessionMinutes).put("allowAllDevices", allowAllDevices).put("origin", origin)
+
+    companion object {
+        fun parse(json: JSONObject): ManagementAuthorization? {
+            val active = json.get("active")
+            require(active is Boolean)
+            if (!active) return null
+            val minutes = json.get("sessionMinutes")
+            val allDevices = json.get("allowAllDevices")
+            val origin = json.get("origin")
+            val expiresAt = json.get("expiresAt")
+            require(minutes is Int && minutes in Repository.sessionMinutesOptions)
+            require(allDevices is Boolean && origin is String && expiresAt is String)
+            return ManagementAuthorization(Instant.parse(expiresAt), minutes, allDevices, Origins.checked(origin))
+        }
+    }
+}
+
 data class WakeRecord(val requestId: String, val result: String, val sentAt: Instant? = null, val code: String? = null, val gatewayConfirmed: Boolean = true, val createdAt: Instant = Instant.now()) {
     companion object {
         fun parse(json: JSONObject, createdAt: Instant = Instant.now()): WakeRecord {

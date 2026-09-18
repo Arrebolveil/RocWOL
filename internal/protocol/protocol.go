@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -49,6 +50,20 @@ type Credentials struct {
 	DeviceID    string    `json:"deviceId,omitempty"`
 	AccessToken string    `json:"accessToken"`
 	ExpiresAt   time.Time `json:"expiresAt"`
+}
+
+type ManagementAuthorization struct {
+	Active          bool      `json:"active"`
+	ExpiresAt       time.Time `json:"expiresAt"`
+	SessionMinutes  int       `json:"sessionMinutes"`
+	AllowAllDevices bool      `json:"allowAllDevices"`
+	Origin          string    `json:"origin"`
+}
+
+type ManagementBrowser struct {
+	URL                    string    `json:"url"`
+	ExpiresAt              time.Time `json:"expiresAt"`
+	AuthorizationExpiresAt time.Time `json:"authorizationExpiresAt"`
 }
 
 func Random(n int) string {
@@ -119,8 +134,12 @@ func PairMessage(id, nonce, wake, manage string) string {
 func WakeMessage(device, id, nonce string) string {
 	return strings.Join([]string{"ROCWOL-WAKE-AUTH-V1", ServiceID, device, id, nonce}, "\n")
 }
-func ManageMessage(device, id, nonce, origin string) string {
-	return strings.Join([]string{"ROCWOL-MANAGE-V1", ServiceID, device, id, nonce, origin}, "\n")
+func ManageMessage(device, id, nonce, origin string, sessionMinutes int, allowAllDevices bool) string {
+	scope := "browser-only"
+	if allowAllDevices {
+		scope = "all-devices"
+	}
+	return strings.Join([]string{"ROCWOL-MANAGE-V2", ServiceID, device, id, nonce, origin, strconv.Itoa(sessionMinutes), scope}, "\n")
 }
 
 // DecodeJSON rejects duplicate keys as well as unknown fields, malformed UTF-8,

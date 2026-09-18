@@ -32,21 +32,60 @@ class Repository(context: Context) {
     val managementPending: Boolean get() = preferences.getBoolean("managementPending", false)
     val sessionMinutes: Int get() = preferences.getInt("sessionMinutes", DEFAULT_SESSION_MINUTES)
         .takeIf { it in sessionMinutesOptions } ?: DEFAULT_SESSION_MINUTES
-    // A legacy pending marker without a duration must retain the conservative server maximum.
-    val pendingSessionMinutes: Int get() = preferences.getInt("pendingSessionMinutes", sessionMinutesOptions.last())
-        .takeIf { it in sessionMinutesOptions } ?: sessionMinutesOptions.last()
+    val autoOpenBrowser: Boolean get() = preferences.getBoolean("autoOpenBrowser", true)
+    val allowAllDevices: Boolean get() = preferences.getBoolean("allowAllDevices", false)
+    private var authorization: ManagementAuthorization? = try {
+        preferences.getString("managementAuthorization", null)?.let { ManagementAuthorization.parse(JSONObject(it)) }
+    } catch (_: Exception) { null }
+    val management: ManagementAuthorization? get() = authorization?.takeIf { Instant.now().isBefore(it.expiresAt) }
+    var managementKnown: Boolean = false
+        private set
 
     suspend fun selectSessionMinutes(value: Int) = withContext(Dispatchers.IO) {
         require(value in sessionMinutesOptions)
         check(preferences.edit().putInt("sessionMinutes", value).commit())
     }
 
-    suspend fun endManagement() {
-        if (!managementPending) return
-        require(authenticated("/_wol/v1/manage/end", JSONObject()).body.getBoolean("ended"))
+    suspend fun setAutoOpenBrowser(value: Boolean) = withContext(Dispatchers.IO) {
+        check(preferences.edit().putBoolean("autoOpenBrowser", value).commit())
+    }
+
+    suspend fun setAllowAllDevices(value: Boolean) = withContext(Dispatchers.IO) {
+        check(preferences.edit().putBoolean("allowAllDevices", value).commit())
+    }
+
+    private suspend fun markManagementUncertain() {
         withContext(Dispatchers.IO) {
-            check(preferences.edit().remove("managementPending").remove("pendingSessionMinutes").commit())
+            check(preferences.edit().putBoolean("managementPending", true).remove("pendingSessionMinutes").commit())
         }
+        managementKnown = false
+    }
+
+    private suspend fun rememberManagement(value: ManagementAuthorization?) {
+        withContext(Dispatchers.IO) {
+            val editor = preferences.edit().putBoolean("managementPending", value != null).remove("pendingSessionMinutes")
+            if (value == null) editor.remove("managementAuthorization")
+            else editor.putString("managementAuthorization", value.toJson().toString())
+            check(editor.commit())
+        }
+        authorization = value
+        managementKnown = true
+    }
+
+    suspend fun managementStatus(): ManagementAuthorization? {
+        managementKnown = false
+        val reply = authenticated("/_wol/v1/manage/status")
+        require(reply.status in 200..299)
+        rememberManagement(ManagementAuthorization.parse(reply.body))
+        return management
+    }
+
+    suspend fun endManagement() {
+        // Always ask the server, including after process death or a lost authorization response.
+        markManagementUncertain()
+        val reply = authenticated("/_wol/v1/manage/end", JSONObject())
+        require(reply.status in 200..299 && reply.body.get("ended") == true)
+        rememberManagement(null)
     }
 
     fun rememberedWake(): WakeRecord? = try {
@@ -67,16 +106,20 @@ class Repository(context: Context) {
         check(preferences.edit().putString("lastWake", json.toString()).commit())
     }
     suspend fun selectOrigin(value: String) = withContext(Dispatchers.IO) {
-        origin = Origins.checked(value)
+        val selected = Origins.checked(value)
+        check(preferences.edit().putString("origin", selected).commit())
+        origin = selected
         clearToken()
-        check(preferences.edit().putString("origin", origin).commit())
     }
     fun clearToken() { token = null; tokenExpiry = Instant.EPOCH }
     suspend fun forgetIdentity() = withContext(Dispatchers.IO) {
         clearToken()
         deviceId = null
         keys.removeLocalKeys()
-        check(preferences.edit().remove("deviceId").remove("lastWake").commit())
+        check(preferences.edit().remove("deviceId").remove("lastWake").remove("managementPending")
+            .remove("managementAuthorization").remove("pendingSessionMinutes").commit())
+        authorization = null
+        managementKnown = false
     }
     suspend fun pair(activity: Activity, code: String, name: String) {
         require(deviceId == null)
@@ -92,7 +135,7 @@ class Repository(context: Context) {
         val challenge = Challenge.parse(response)
         val message = listOf("ROCWOL-PAIR-V1", "roc-wol", challenge.id, challenge.nonce, DeviceKeys.hash(wake), DeviceKeys.hash(manage)).joinToString("\n")
         val wakeSignature = keys.signWake(message)
-        val managementSignature = keys.signManagement(activity, message, sessionMinutes = null)
+        val managementSignature = keys.signManagement(activity, message, sessionMinutes = null, allowAllDevices = false)
         check(Instant.now().isBefore(challenge.expiresAt)) { "Challenge expired" }
         val completed = api.request(origin, "/_wol/v1/pair/complete", JSONObject().put("challengeId", challenge.id)
             .put("wakeSignature", wakeSignature).put("manageSignature", managementSignature)).body
@@ -127,9 +170,9 @@ class Repository(context: Context) {
         }
         token ?: throw IdentityLost()
     }
-    private suspend fun authenticated(path: String, body: JSONObject? = null): ApiReply {
+    private suspend fun authenticated(path: String, body: JSONObject? = null, requestOrigin: String = origin): ApiReply {
         val access = accessToken()
-        return try { api.request(origin, path, body, access) } catch (e: ApiException) {
+        return try { api.request(requestOrigin, path, body, access) } catch (e: ApiException) {
             if (e.status == 401) clearToken()
             throw e
         }
@@ -143,23 +186,41 @@ class Repository(context: Context) {
         val response = authenticated("/_wol/v1/wake/${record.requestId}")
         return WakeRecord.parse(response.body, record.createdAt).also { require(it.requestId == record.requestId) }
     }
-    suspend fun management(activity: Activity): String {
+    suspend fun authorizeManagement(activity: Activity): ManagementAuthorization {
         val id = deviceId ?: throw IdentityLost()
         val selectedOrigin = origin
         val selectedMinutes = sessionMinutes
+        val selectedScope = allowAllDevices
         val challenge = Challenge.parse(authenticated("/_wol/v1/manage/challenge", JSONObject()
-            .put("origin", selectedOrigin).put("sessionMinutes", selectedMinutes)).body)
-        val message = listOf("ROCWOL-MANAGE-V1", "roc-wol", id, challenge.id, challenge.nonce, selectedOrigin).joinToString("\n")
-        val signature = keys.signManagement(activity, message, sessionMinutes = selectedMinutes)
+            .put("origin", selectedOrigin).put("sessionMinutes", selectedMinutes).put("allowAllDevices", selectedScope)).body)
+        val message = listOf("ROCWOL-MANAGE-V2", "roc-wol", id, challenge.id, challenge.nonce, selectedOrigin,
+            selectedMinutes.toString(), if (selectedScope) "all-devices" else "browser-only").joinToString("\n")
+        val signature = keys.signManagement(activity, message, sessionMinutes = selectedMinutes, allowAllDevices = selectedScope)
         check(Instant.now().isBefore(challenge.expiresAt)) { "Challenge expired" }
-        // Persist before sending: a lost response may still have created a ticket.
-        withContext(Dispatchers.IO) {
-            check(preferences.edit().putBoolean("managementPending", true)
-                .putInt("pendingSessionMinutes", selectedMinutes).commit())
-        }
-        val reply = authenticated("/_wol/v1/manage/ticket", JSONObject().put("challengeId", challenge.id).put("signature", signature)).body
-        require(Instant.now().isBefore(Instant.parse(reply.getString("expiresAt"))))
-        return Origins.managementUrl(reply.getString("url"), selectedOrigin)
+        // Commit before authorizing: the server can accept the signature even if its response is lost.
+        markManagementUncertain()
+        val reply = authenticated("/_wol/v1/manage/authorize", JSONObject().put("challengeId", challenge.id).put("signature", signature))
+        require(reply.status in 200..299)
+        val granted = ManagementAuthorization.parse(reply.body)
+        require(granted != null && granted.origin == selectedOrigin && granted.sessionMinutes == selectedMinutes &&
+            granted.allowAllDevices == selectedScope)
+        rememberManagement(granted)
+        return granted
+    }
+
+    suspend fun managementBrowserUrl(): String {
+        val granted = managementStatus() ?: throw ApiException(409, "management_inactive")
+        val reply = authenticated("/_wol/v1/manage/browser", JSONObject(), requestOrigin = granted.origin)
+        require(reply.status in 200..299)
+        val expiresAt = reply.body.get("expiresAt")
+        val authorizationExpiresAt = reply.body.get("authorizationExpiresAt")
+        val url = reply.body.get("url")
+        require(expiresAt is String && authorizationExpiresAt is String && url is String)
+        val ticketExpiry = Instant.parse(expiresAt)
+        require(Instant.parse(authorizationExpiresAt) == granted.expiresAt &&
+            !ticketExpiry.isAfter(granted.expiresAt) && Instant.now().isBefore(ticketExpiry))
+        // The one-use URL exists only for this browser launch; never store it in preferences or UI state.
+        return Origins.managementUrl(url, granted.origin)
     }
     fun newWake(): WakeRecord {
         val bytes = ByteArray(16).also { SecureRandom().nextBytes(it) }

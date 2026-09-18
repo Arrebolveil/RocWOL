@@ -71,19 +71,47 @@ func identity(t *testing.T, g *Gateway) testIdentity {
 }
 func session(t *testing.T, g *Gateway, id testIdentity) string {
 	t.Helper()
-	c, e := g.Auth.ManageChallenge(id.DeviceID, testOrigin, 10)
+	c, e := g.Auth.ManageChallenge(id.DeviceID, testOrigin, 10, false)
 	if e != nil {
 		t.Fatal(e)
 	}
-	tk, _, e := g.Auth.ManageTicket(id.DeviceID, c.ChallengeID, testSign(t, id.manage, protocol.ManageMessage(id.DeviceID, c.ChallengeID, c.Nonce, testOrigin)), testOrigin)
+	_, e = g.Auth.AuthorizeManagement(id.DeviceID, c.ChallengeID, testSign(t, id.manage, protocol.ManageMessage(id.DeviceID, c.ChallengeID, c.Nonce, testOrigin, 10, false)), testOrigin)
 	if e != nil {
 		t.Fatal(e)
 	}
-	cookie, _, e := g.Auth.Redeem(tk, testOrigin)
+	link, e := g.Auth.ManagementBrowser(id.DeviceID, testOrigin)
+	if e != nil {
+		t.Fatal(e)
+	}
+	cookie, _, e := g.Auth.Redeem(strings.TrimPrefix(link.URL, testOrigin+"/_wol/manage#t="), testOrigin)
 	if e != nil {
 		t.Fatal(e)
 	}
 	return cookie
+}
+
+func authorizeManagement(t *testing.T, g *Gateway, id testIdentity, all bool) protocol.ManagementAuthorization {
+	t.Helper()
+	payload, _ := json.Marshal(map[string]any{"origin": testOrigin, "sessionMinutes": 10, "allowAllDevices": all})
+	w := request(g, "POST", "/_wol/v1/manage/challenge", id.AccessToken, "", string(payload))
+	if w.Code != 200 {
+		t.Fatalf("challenge: %d %s", w.Code, w.Body.String())
+	}
+	var c protocol.Challenge
+	if err := json.Unmarshal(w.Body.Bytes(), &c); err != nil {
+		t.Fatal(err)
+	}
+	msg := protocol.ManageMessage(id.DeviceID, c.ChallengeID, c.Nonce, testOrigin, 10, all)
+	payload, _ = json.Marshal(map[string]string{"challengeId": c.ChallengeID, "signature": testSign(t, id.manage, msg)})
+	w = request(g, "POST", "/_wol/v1/manage/authorize", id.AccessToken, "", string(payload))
+	if w.Code != 200 {
+		t.Fatalf("authorize: %d %s", w.Code, w.Body.String())
+	}
+	var result protocol.ManagementAuthorization
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	return result
 }
 func fixture(t *testing.T, h http.HandlerFunc) *Gateway {
 	t.Helper()
@@ -315,7 +343,7 @@ func TestProxyCookieAndRedirectBoundary(t *testing.T) {
 	}
 }
 func TestWebSocketExpiresAndRevokesAfterHandshake(t *testing.T) {
-	for _, mode := range []string{"expires", "revokes"} {
+	for _, mode := range []string{"expires", "revokes", "ends", "anonymous-expires", "anonymous-revokes", "anonymous-ends"} {
 		t.Run(mode, func(t *testing.T) {
 			closed := make(chan struct{}, 1)
 			g := fixture(t, func(w http.ResponseWriter, r *http.Request) {
@@ -330,10 +358,15 @@ func TestWebSocketExpiresAndRevokesAfterHandshake(t *testing.T) {
 				closed <- struct{}{}
 			})
 			id := identity(t, g)
-			if mode == "expires" {
+			if strings.HasSuffix(mode, "expires") {
 				g.Auth.MaxSessionTTL = 500 * time.Millisecond
 			}
-			cookie := session(t, g, id)
+			var cookie string
+			if strings.HasPrefix(mode, "anonymous-") {
+				authorizeManagement(t, g, id, true)
+			} else {
+				cookie = session(t, g, id)
+			}
 			server := httptest.NewServer(g)
 			defer server.Close()
 			conn, e := net.Dial("tcp", strings.TrimPrefix(server.URL, "http://"))
@@ -350,9 +383,15 @@ func TestWebSocketExpiresAndRevokesAfterHandshake(t *testing.T) {
 			if resp.StatusCode != 101 {
 				t.Fatalf("upgrade status %d", resp.StatusCode)
 			}
-			if mode == "revokes" {
+			if strings.HasSuffix(mode, "revokes") {
 				if e = g.Auth.Revoke(id.DeviceID); e != nil {
 					t.Fatal(e)
+				}
+			}
+			if strings.HasSuffix(mode, "ends") {
+				w := request(g, "POST", "/_wol/v1/manage/end", id.AccessToken, "", "{}")
+				if w.Code != 200 {
+					t.Fatalf("end: %d %s", w.Code, w.Body.String())
 				}
 			}
 			select {
@@ -377,15 +416,19 @@ func TestStrictJSONAndPublicRedemption(t *testing.T) {
 		}
 	}
 	id := identity(t, g)
-	c, e := g.Auth.ManageChallenge(id.DeviceID, testOrigin, 10)
+	c, e := g.Auth.ManageChallenge(id.DeviceID, testOrigin, 10, false)
 	if e != nil {
 		t.Fatal(e)
 	}
-	tk, _, e := g.Auth.ManageTicket(id.DeviceID, c.ChallengeID, testSign(t, id.manage, protocol.ManageMessage(id.DeviceID, c.ChallengeID, c.Nonce, testOrigin)), testOrigin)
+	_, e = g.Auth.AuthorizeManagement(id.DeviceID, c.ChallengeID, testSign(t, id.manage, protocol.ManageMessage(id.DeviceID, c.ChallengeID, c.Nonce, testOrigin, 10, false)), testOrigin)
 	if e != nil {
 		t.Fatal(e)
 	}
-	payload, _ := json.Marshal(map[string]string{"ticket": tk})
+	link, e := g.Auth.ManagementBrowser(id.DeviceID, testOrigin)
+	if e != nil {
+		t.Fatal(e)
+	}
+	payload, _ := json.Marshal(map[string]string{"ticket": strings.TrimPrefix(link.URL, testOrigin+"/_wol/manage#t=")})
 	w := request(g, "POST", "/_wol/v1/manage/redeem", "", "", string(payload))
 	if w.Code != 200 {
 		t.Fatal(w.Code)
@@ -397,5 +440,107 @@ func TestStrictJSONAndPublicRedemption(t *testing.T) {
 	w = request(g, "POST", "/_wol/v1/manage/redeem", "", "", string(payload))
 	if w.Code != 409 {
 		t.Fatal("ticket replay accepted")
+	}
+}
+
+func TestManagementAPIScopeAndAnonymousBoundary(t *testing.T) {
+	var hits atomic.Int32
+	g := fixture(t, func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		// The outer grant must not replace LuCI's own authentication.
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte("LuCI login required"))
+	})
+	id := identity(t, g)
+	if w := request(g, "GET", "/_wol/v1/manage/status", "", "", ""); w.Code != 401 {
+		t.Fatalf("unprotected status: %d", w.Code)
+	}
+	w := request(g, "GET", "/_wol/v1/manage/status", id.AccessToken, "", "")
+	var inactive struct {
+		Active bool `json:"active"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &inactive); err != nil || w.Code != 200 || inactive.Active {
+		t.Fatalf("inactive status: %d %s", w.Code, w.Body.String())
+	}
+	if w := request(g, "POST", "/_wol/v1/manage/browser", id.AccessToken, "", "{}"); w.Code != 403 {
+		t.Fatalf("wake bearer created authorization: %d", w.Code)
+	}
+	for _, payload := range []string{
+		`{"origin":"https://wol.hubu.wiki","sessionMinutes":10}`,
+		`{"origin":"https://wol.hubu.wiki","sessionMinutes":10,"allowAllDevices":null}`,
+		`{"origin":"https://wol.hubu.wiki","sessionMinutes":null,"allowAllDevices":false}`,
+		`{"origin":"https://wol.hubu.wiki","sessionMinutes":10,"allowAllDevices":"true"}`,
+		`{"origin":"https://wol.hubu.wiki","sessionMinutes":31,"allowAllDevices":true}`,
+		`{"origin":"https://wol.hubu.wiki","sessionMinutes":10,"allowAllDevices":true,"extra":true}`,
+	} {
+		if w := request(g, "POST", "/_wol/v1/manage/challenge", id.AccessToken, "", payload); w.Code != 400 {
+			t.Fatalf("malformed scope accepted: %d %s", w.Code, payload)
+		}
+	}
+	if w := request(g, "POST", "/_wol/v1/manage/authorize", id.AccessToken, "", `{"challengeId":null,"signature":null}`); w.Code != 400 {
+		t.Fatalf("missing authorization proof accepted: %d", w.Code)
+	}
+	authorizeManagement(t, g, id, false)
+	if w := request(g, "GET", "/cgi-bin/luci/", "", "", ""); w.Code != 401 || hits.Load() != 0 {
+		t.Fatalf("browser-only authorization allowed anonymous access: %d", w.Code)
+	}
+	grant := authorizeManagement(t, g, id, true)
+	if !grant.Active || !grant.AllowAllDevices || grant.Origin != testOrigin {
+		t.Fatalf("wrong authorization: %+v", grant)
+	}
+	w = request(g, "GET", "/cgi-bin/luci/", "", "", "")
+	if w.Code != 401 || w.Body.String() != "LuCI login required" || hits.Load() != 1 {
+		t.Fatalf("anonymous LuCI admission changed upstream login: %d %s", w.Code, w.Body.String())
+	}
+	for _, tc := range []struct {
+		method, path, host, origin string
+		status                     int
+	}{
+		{"GET", "/cgi-bin/luci/", "roc.hubu.wiki", "https://roc.hubu.wiki", 401},
+		{"POST", "/ubus", "wol.hubu.wiki", "https://evil.example", 403},
+		{"GET", "/_roc-agent/v1/status", "wol.hubu.wiki", testOrigin, 404},
+		{"GET", "/_wol/v1/manage/status", "wol.hubu.wiki", testOrigin, 401},
+		{"POST", "/_wol/v1/manage/browser", "wol.hubu.wiki", testOrigin, 401},
+		{"GET", "/_wol/v1/target", "wol.hubu.wiki", testOrigin, 401},
+	} {
+		r := httptest.NewRequest(tc.method, tc.path, strings.NewReader("{}"))
+		r.Host = tc.host
+		r.Header.Set("Origin", tc.origin)
+		w := httptest.NewRecorder()
+		g.ServeHTTP(w, r)
+		if w.Code != tc.status {
+			t.Fatalf("boundary %s %s: %d", tc.host, tc.path, w.Code)
+		}
+	}
+	if hits.Load() != 1 {
+		t.Fatal("protected requests reached upstream")
+	}
+	w = request(g, "POST", "/_wol/v1/manage/browser", id.AccessToken, "", "{}")
+	if w.Code != 200 {
+		t.Fatalf("browser ticket: %d %s", w.Code, w.Body.String())
+	}
+	var link protocol.ManagementBrowser
+	if err := json.Unmarshal(w.Body.Bytes(), &link); err != nil {
+		t.Fatal(err)
+	}
+	if !link.AuthorizationExpiresAt.Equal(grant.ExpiresAt) || link.ExpiresAt.After(grant.ExpiresAt) {
+		t.Fatalf("browser request changed expiry: %+v", link)
+	}
+	for _, path := range []string{"/_wol/v1/manage/browser", "/_wol/v1/manage/end"} {
+		if w := request(g, "POST", path, id.AccessToken, "", `{"allowAllDevices":false}`); w.Code != 400 {
+			t.Fatalf("unexpected fields accepted by %s: %d", path, w.Code)
+		}
+	}
+	for range 2 {
+		if w := request(g, "POST", "/_wol/v1/manage/end", id.AccessToken, "", "{}"); w.Code != 200 {
+			t.Fatalf("idempotent end: %d", w.Code)
+		}
+	}
+	w = request(g, "GET", "/cgi-bin/luci/", "", "", "")
+	if w.Code != 401 || hits.Load() != 1 {
+		t.Fatal("anonymous access survived end")
+	}
+	if w := request(g, "POST", "/_wol/v1/manage/browser", id.AccessToken, "", "{}"); w.Code != 403 {
+		t.Fatal("browser ticket revived ended grant")
 	}
 }
