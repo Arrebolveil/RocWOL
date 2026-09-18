@@ -15,7 +15,7 @@ import java.time.Instant
 class Repository(context: Context) {
     companion object {
         const val DEFAULT_SESSION_MINUTES = 10
-        val sessionMinutesOptions = listOf(5, 10, 15, 30)
+        val sessionMinutesOptions = listOf(5, 10, 15, 30, 0)
     }
     private val preferences = context.getSharedPreferences("roc_wol_identity", Context.MODE_PRIVATE)
     val keys = DeviceKeys()
@@ -34,10 +34,11 @@ class Repository(context: Context) {
         .takeIf { it in sessionMinutesOptions } ?: DEFAULT_SESSION_MINUTES
     val autoOpenBrowser: Boolean get() = preferences.getBoolean("autoOpenBrowser", true)
     val allowAllDevices: Boolean get() = preferences.getBoolean("allowAllDevices", false)
+    val warnAllDevices: Boolean get() = preferences.getBoolean("warnAllDevices", true)
     private var authorization: ManagementAuthorization? = try {
         preferences.getString("managementAuthorization", null)?.let { ManagementAuthorization.parse(JSONObject(it)) }
     } catch (_: Exception) { null }
-    val management: ManagementAuthorization? get() = authorization?.takeIf { Instant.now().isBefore(it.expiresAt) }
+    val management: ManagementAuthorization? get() = authorization?.takeIf { it.isPermanent || Instant.now().isBefore(it.expiresAt) }
     var managementKnown: Boolean = false
         private set
 
@@ -50,8 +51,21 @@ class Repository(context: Context) {
         check(preferences.edit().putBoolean("autoOpenBrowser", value).commit())
     }
 
-    suspend fun setAllowAllDevices(value: Boolean) = withContext(Dispatchers.IO) {
-        check(preferences.edit().putBoolean("allowAllDevices", value).commit())
+    suspend fun setWarnAllDevices(value: Boolean) = withContext(Dispatchers.IO) {
+        check(preferences.edit().putBoolean("warnAllDevices", value).commit())
+    }
+
+    suspend fun setAllowAllDevices(value: Boolean) {
+        if (!value && deviceId != null) {
+            // Keep the unsafe scope visible until this device's server grant is confirmed closed.
+            withContext(Dispatchers.IO) {
+                check(preferences.edit().putBoolean("allowAllDevices", true).commit())
+            }
+            endManagement()
+        }
+        withContext(Dispatchers.IO) {
+            check(preferences.edit().putBoolean("allowAllDevices", value).commit())
+        }
     }
 
     private suspend fun markManagementUncertain() {
@@ -177,7 +191,8 @@ class Repository(context: Context) {
             throw e
         }
     }
-    suspend fun target(): Target = Target.parse(authenticated("/_wol/v1/target").body)
+    suspend fun target(fresh: Boolean = false): Target =
+        Target.parse(authenticated(if (fresh) "/_wol/v1/target?fresh=1" else "/_wol/v1/target").body)
     suspend fun sendWake(record: WakeRecord): WakeRecord {
         val response = authenticated("/_wol/v1/wake", JSONObject().put("targetId", "desktop").put("requestId", record.requestId))
         return WakeRecord.parse(response.body, record.createdAt).also { require(it.requestId == record.requestId) }
@@ -217,8 +232,11 @@ class Repository(context: Context) {
         val url = reply.body.get("url")
         require(expiresAt is String && authorizationExpiresAt is String && url is String)
         val ticketExpiry = Instant.parse(expiresAt)
+        val now = Instant.now()
         require(Instant.parse(authorizationExpiresAt) == granted.expiresAt &&
-            !ticketExpiry.isAfter(granted.expiresAt) && Instant.now().isBefore(ticketExpiry))
+            (if (granted.isPermanent) authorizationExpiresAt == ManagementAuthorization.PERMANENT_EXPIRY
+                else !ticketExpiry.isAfter(granted.expiresAt)) &&
+            now.isBefore(ticketExpiry))
         // The one-use URL exists only for this browser launch; never store it in preferences or UI state.
         return Origins.managementUrl(url, granted.origin)
     }

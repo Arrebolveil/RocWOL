@@ -69,16 +69,9 @@ func identity(t *testing.T, g *Gateway) testIdentity {
 	}
 	return testIdentity{creds, mk}
 }
-func session(t *testing.T, g *Gateway, id testIdentity) string {
+func session(t *testing.T, g *Gateway, id testIdentity, minutes int) string {
 	t.Helper()
-	c, e := g.Auth.ManageChallenge(id.DeviceID, testOrigin, 10, false)
-	if e != nil {
-		t.Fatal(e)
-	}
-	_, e = g.Auth.AuthorizeManagement(id.DeviceID, c.ChallengeID, testSign(t, id.manage, protocol.ManageMessage(id.DeviceID, c.ChallengeID, c.Nonce, testOrigin, 10, false)), testOrigin)
-	if e != nil {
-		t.Fatal(e)
-	}
+	authorizeManagement(t, g, id, minutes, false)
 	link, e := g.Auth.ManagementBrowser(id.DeviceID, testOrigin)
 	if e != nil {
 		t.Fatal(e)
@@ -90,9 +83,9 @@ func session(t *testing.T, g *Gateway, id testIdentity) string {
 	return cookie
 }
 
-func authorizeManagement(t *testing.T, g *Gateway, id testIdentity, all bool) protocol.ManagementAuthorization {
+func authorizeManagement(t *testing.T, g *Gateway, id testIdentity, minutes int, all bool) protocol.ManagementAuthorization {
 	t.Helper()
-	payload, _ := json.Marshal(map[string]any{"origin": testOrigin, "sessionMinutes": 10, "allowAllDevices": all})
+	payload, _ := json.Marshal(map[string]any{"origin": testOrigin, "sessionMinutes": minutes, "allowAllDevices": all})
 	w := request(g, "POST", "/_wol/v1/manage/challenge", id.AccessToken, "", string(payload))
 	if w.Code != 200 {
 		t.Fatalf("challenge: %d %s", w.Code, w.Body.String())
@@ -101,7 +94,7 @@ func authorizeManagement(t *testing.T, g *Gateway, id testIdentity, all bool) pr
 	if err := json.Unmarshal(w.Body.Bytes(), &c); err != nil {
 		t.Fatal(err)
 	}
-	msg := protocol.ManageMessage(id.DeviceID, c.ChallengeID, c.Nonce, testOrigin, 10, all)
+	msg := protocol.ManageMessage(id.DeviceID, c.ChallengeID, c.Nonce, testOrigin, minutes, all)
 	payload, _ = json.Marshal(map[string]string{"challengeId": c.ChallengeID, "signature": testSign(t, id.manage, msg)})
 	w = request(g, "POST", "/_wol/v1/manage/authorize", id.AccessToken, "", string(payload))
 	if w.Code != 200 {
@@ -143,7 +136,7 @@ func TestNoManagementOrAgentBypass(t *testing.T) {
 	var hits atomic.Int32
 	g := fixture(t, func(w http.ResponseWriter, r *http.Request) { hits.Add(1); w.WriteHeader(200) })
 	id := identity(t, g)
-	cookie := session(t, g, id)
+	cookie := session(t, g, id, 10)
 	for _, path := range []string{"/", "/cgi-bin/luci/", "/ubus", "/luci-static/resources/view/wol.js"} {
 		w := request(g, "GET", path, id.AccessToken, "", "")
 		if w.Code != 401 {
@@ -180,7 +173,7 @@ func TestOriginAndHostFailClosed(t *testing.T) {
 	var hits atomic.Int32
 	g := fixture(t, func(w http.ResponseWriter, r *http.Request) { hits.Add(1) })
 	id := identity(t, g)
-	cookie := session(t, g, id)
+	cookie := session(t, g, id, 10)
 	for _, origin := range []string{"", "https://evil.example", "https://roc.hubu.wiki"} {
 		r := httptest.NewRequest("POST", "/ubus", strings.NewReader("{}"))
 		r.Host = "wol.hubu.wiki"
@@ -307,7 +300,7 @@ func TestProxyRejectsBrowserNetworkPathRedirect(t *testing.T) {
 		w.WriteHeader(http.StatusFound)
 	})
 	id := identity(t, g)
-	w := request(g, "GET", "/cgi-bin/luci/", "", session(t, g, id), "")
+	w := request(g, "GET", "/cgi-bin/luci/", "", session(t, g, id, 10), "")
 	if w.Code != 503 || w.Header().Get("Location") != "" {
 		t.Fatalf("external browser redirect escaped gateway: %d %q", w.Code, w.Header().Get("Location"))
 	}
@@ -328,7 +321,7 @@ func TestProxyCookieAndRedirectBoundary(t *testing.T) {
 		w.WriteHeader(302)
 	})
 	id := identity(t, g)
-	cookie := session(t, g, id)
+	cookie := session(t, g, id, 10)
 	w := request(g, "GET", "/cgi-bin/luci/", id.AccessToken, cookie, "")
 	if w.Code != 302 || w.Header().Get("Location") != testOrigin+"/cgi-bin/luci/" {
 		t.Fatalf("internal redirect not translated: %d %s", w.Code, w.Header().Get("Location"))
@@ -343,7 +336,7 @@ func TestProxyCookieAndRedirectBoundary(t *testing.T) {
 	}
 }
 func TestWebSocketExpiresAndRevokesAfterHandshake(t *testing.T) {
-	for _, mode := range []string{"expires", "revokes", "ends", "anonymous-expires", "anonymous-revokes", "anonymous-ends"} {
+	for _, mode := range []string{"expires", "revokes", "ends", "anonymous-expires", "anonymous-revokes", "anonymous-ends", "permanent-revokes", "permanent-ends", "anonymous-permanent-revokes", "anonymous-permanent-ends"} {
 		t.Run(mode, func(t *testing.T) {
 			closed := make(chan struct{}, 1)
 			g := fixture(t, func(w http.ResponseWriter, r *http.Request) {
@@ -361,11 +354,15 @@ func TestWebSocketExpiresAndRevokesAfterHandshake(t *testing.T) {
 			if strings.HasSuffix(mode, "expires") {
 				g.Auth.MaxSessionTTL = 500 * time.Millisecond
 			}
+			minutes := 10
+			if strings.Contains(mode, "permanent") {
+				minutes = 0
+			}
 			var cookie string
 			if strings.HasPrefix(mode, "anonymous-") {
-				authorizeManagement(t, g, id, true)
+				authorizeManagement(t, g, id, minutes, true)
 			} else {
-				cookie = session(t, g, id)
+				cookie = session(t, g, id, minutes)
 			}
 			server := httptest.NewServer(g)
 			defer server.Close()
@@ -480,11 +477,11 @@ func TestManagementAPIScopeAndAnonymousBoundary(t *testing.T) {
 	if w := request(g, "POST", "/_wol/v1/manage/authorize", id.AccessToken, "", `{"challengeId":null,"signature":null}`); w.Code != 400 {
 		t.Fatalf("missing authorization proof accepted: %d", w.Code)
 	}
-	authorizeManagement(t, g, id, false)
+	authorizeManagement(t, g, id, 10, false)
 	if w := request(g, "GET", "/cgi-bin/luci/", "", "", ""); w.Code != 401 || hits.Load() != 0 {
 		t.Fatalf("browser-only authorization allowed anonymous access: %d", w.Code)
 	}
-	grant := authorizeManagement(t, g, id, true)
+	grant := authorizeManagement(t, g, id, 10, true)
 	if !grant.Active || !grant.AllowAllDevices || grant.Origin != testOrigin {
 		t.Fatalf("wrong authorization: %+v", grant)
 	}
@@ -542,5 +539,84 @@ func TestManagementAPIScopeAndAnonymousBoundary(t *testing.T) {
 	}
 	if w := request(g, "POST", "/_wol/v1/manage/browser", id.AccessToken, "", "{}"); w.Code != 403 {
 		t.Fatal("browser ticket revived ended grant")
+	}
+}
+
+func TestPermanentBrowserCookieAndWireContract(t *testing.T) {
+	g := fixture(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("LuCI"))
+	})
+	id := identity(t, g)
+	authorizeManagement(t, g, id, 0, false)
+	status := request(g, "GET", "/_wol/v1/manage/status", id.AccessToken, "", "")
+	var grant struct {
+		Active         bool   `json:"active"`
+		SessionMinutes int    `json:"sessionMinutes"`
+		ExpiresAt      string `json:"expiresAt"`
+	}
+	if err := json.Unmarshal(status.Body.Bytes(), &grant); err != nil || status.Code != 200 || !grant.Active || grant.SessionMinutes != 0 || grant.ExpiresAt != "0001-01-01T00:00:00Z" {
+		t.Fatalf("permanent grant wire contract: %d %s", status.Code, status.Body.String())
+	}
+	link := request(g, "POST", "/_wol/v1/manage/browser", id.AccessToken, "", "{}")
+	var ticket struct {
+		URL                    string    `json:"url"`
+		ExpiresAt              time.Time `json:"expiresAt"`
+		AuthorizationExpiresAt string    `json:"authorizationExpiresAt"`
+	}
+	if err := json.Unmarshal(link.Body.Bytes(), &ticket); err != nil || link.Code != 200 || ticket.AuthorizationExpiresAt != "0001-01-01T00:00:00Z" || !ticket.ExpiresAt.After(time.Now()) || ticket.ExpiresAt.After(time.Now().Add(time.Minute)) {
+		t.Fatalf("permanent browser ticket wire contract: %d %s", link.Code, link.Body.String())
+	}
+	payload, _ := json.Marshal(map[string]string{"ticket": strings.TrimPrefix(ticket.URL, testOrigin+"/_wol/manage#t=")})
+	w := request(g, "POST", "/_wol/v1/manage/redeem", "", "", string(payload))
+	cookies := w.Result().Cookies()
+	if w.Code != 200 || len(cookies) != 1 {
+		t.Fatalf("ticket redemption failed: %d %s", w.Code, w.Body.String())
+	}
+	cookie := cookies[0]
+	if cookie.Name != "__Host-roc_session" || cookie.Value == "" || !cookie.HttpOnly || !cookie.Secure || cookie.SameSite != http.SameSiteStrictMode || cookie.Path != "/" || cookie.Domain != "" || !cookie.Expires.IsZero() || cookie.MaxAge != 0 {
+		t.Fatalf("permanent grant did not emit a secure session cookie: %+v", cookie)
+	}
+	if w := request(g, "GET", "/cgi-bin/luci/", "", cookie.Value, ""); w.Code != 200 || w.Body.String() != "LuCI" {
+		t.Fatalf("permanent cookie did not admit browser: %d %s", w.Code, w.Body.String())
+	}
+	if w := request(g, "POST", "/_wol/v1/manage/redeem", "", "", string(payload)); w.Code != 409 {
+		t.Fatal("permanent ticket allowed replay")
+	}
+	if w := request(g, "POST", "/_wol/v1/manage/end", id.AccessToken, "", "{}"); w.Code != 200 {
+		t.Fatal("permanent end failed:", w.Code)
+	}
+	if w := request(g, "GET", "/cgi-bin/luci/", "", cookie.Value, ""); w.Code != 401 {
+		t.Fatal("permanent browser survived end:", w.Code)
+	}
+}
+
+func TestTargetRefreshForwardsOnlyExplicitFreshRequest(t *testing.T) {
+	queries := make(chan string, 3)
+	g := fixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/_roc-agent/v1/status" {
+			t.Error("unexpected upstream path:", r.URL.Path)
+		}
+		queries <- r.URL.RawQuery
+		now := time.Now().UTC()
+		protocol.JSON(w, 200, protocol.Status{TargetID: "desktop", Reachability: "reachable", CheckedAt: &now})
+	})
+	id := identity(t, g)
+	for _, tc := range []struct{ path, query string }{
+		{"/_wol/v1/target", ""},
+		{"/_wol/v1/target?fresh=1&ignored=1", "fresh=1"},
+		{"/_wol/v1/target?fresh=0", ""},
+	} {
+		w := request(g, "GET", tc.path, id.AccessToken, "", "")
+		if w.Code != 200 {
+			t.Fatalf("target failed: %s: %d %s", tc.path, w.Code, w.Body.String())
+		}
+		select {
+		case query := <-queries:
+			if query != tc.query {
+				t.Fatalf("incorrect fresh forwarding: %s: %q", tc.path, query)
+			}
+		default:
+			t.Fatal("target did not request agent status")
+		}
 	}
 }

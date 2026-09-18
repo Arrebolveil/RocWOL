@@ -28,7 +28,8 @@ data class ApiReply(val status: Int, val body: JSONObject)
 
 class Api {
     suspend fun request(origin: String, path: String, body: JSONObject? = null, token: String? = null): ApiReply = withContext(Dispatchers.IO) {
-        require(path.startsWith("/_wol/v1/") && !path.contains('?') && !path.contains('#'))
+        require(path.startsWith("/_wol/v1/") && !path.contains('#') &&
+            (!path.contains('?') || (path == "/_wol/v1/target?fresh=1" && body == null)))
         val connection = URL(Origins.checked(origin) + path).openConnection() as HttpsURLConnection
         try {
             connection.connectTimeout = 5_000
@@ -95,10 +96,12 @@ data class ManagementAuthorization(
     val allowAllDevices: Boolean,
     val origin: String
 ) {
+    val isPermanent: Boolean get() = sessionMinutes == 0
     fun toJson(): JSONObject = JSONObject().put("active", true).put("expiresAt", expiresAt.toString())
         .put("sessionMinutes", sessionMinutes).put("allowAllDevices", allowAllDevices).put("origin", origin)
 
     companion object {
+        const val PERMANENT_EXPIRY = "0001-01-01T00:00:00Z"
         fun parse(json: JSONObject): ManagementAuthorization? {
             val active = json.get("active")
             require(active is Boolean)
@@ -109,6 +112,7 @@ data class ManagementAuthorization(
             val expiresAt = json.get("expiresAt")
             require(minutes is Int && minutes in Repository.sessionMinutesOptions)
             require(allDevices is Boolean && origin is String && expiresAt is String)
+            require((minutes == 0) == (expiresAt == PERMANENT_EXPIRY))
             return ManagementAuthorization(Instant.parse(expiresAt), minutes, allDevices, Origins.checked(origin))
         }
     }

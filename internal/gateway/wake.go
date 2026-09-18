@@ -31,7 +31,11 @@ func (g *Gateway) agentRequest(r *http.Request, method, path string, payload any
 func (g *Gateway) target(w http.ResponseWriter, r *http.Request, device string) {
 	status := protocol.Status{TargetID: "desktop", Reachability: "unknown"}
 	router := "unavailable"
-	resp, e := g.agentRequest(r, "GET", "/_roc-agent/v1/status", nil)
+	path := "/_roc-agent/v1/status"
+	if r.URL.Query().Get("fresh") == "1" {
+		path += "?fresh=1"
+	}
+	resp, e := g.agentRequest(r, "GET", path, nil)
 	if e == nil {
 		defer drainClose(resp.Body)
 		var received protocol.Status

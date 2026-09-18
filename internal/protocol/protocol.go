@@ -52,6 +52,8 @@ type Credentials struct {
 	ExpiresAt   time.Time `json:"expiresAt"`
 }
 
+// ManagementAuthorization uses SessionMinutes == 0 and a zero ExpiresAt for
+// revocable, non-expiring grants. Challenges and browser tickets remain finite.
 type ManagementAuthorization struct {
 	Active          bool      `json:"active"`
 	ExpiresAt       time.Time `json:"expiresAt"`

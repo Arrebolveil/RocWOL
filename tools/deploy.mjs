@@ -562,6 +562,9 @@ async function protocolSmoke(server, config, host) {
     const token = tokenReply.body.accessToken;
     const target = await api(origin, 'target', null, token);
     must(target.status === 200 && target.body.targetId === 'desktop' && target.body.router === 'available', 'Authenticated target cannot reach private agent');
+    const fresh = await api(origin, 'target?fresh=1', null, token);
+    must(fresh.status === 200 && fresh.body.router === 'available' &&
+      Date.parse(fresh.body.checkedAt) > Date.parse(target.body.checkedAt), 'Manual refresh reused a cached probe timestamp');
     const otherHost = host === config.directHost ? config.fallbackHost : config.directHost;
     const canonical = (challenge, sessionMinutes, allowAllDevices, selectedOrigin = origin) =>
       ['ROCWOL-MANAGE-V2', 'roc-wol', deviceId, challenge.challengeId, challenge.nonce, selectedOrigin, String(sessionMinutes), allowAllDevices ? 'all-devices' : 'browser-only'].join('\n');
@@ -581,8 +584,10 @@ async function protocolSmoke(server, config, host) {
       const remaining = Date.parse(authorized.body.expiresAt) - Date.parse(authorized.headers.date);
       must(authorized.status === 200 && authorized.body.active === true &&
         authorized.body.sessionMinutes === sessionMinutes && authorized.body.allowAllDevices === allowAllDevices &&
-        authorized.body.origin === origin && remaining > 0 && remaining <= sessionMinutes * 60000 + 1000,
-      'Hardware signature did not establish the selected bounded authorization');
+        authorized.body.origin === origin && (sessionMinutes === 0
+          ? authorized.body.expiresAt === '0001-01-01T00:00:00Z'
+          : remaining > 0 && remaining <= sessionMinutes * 60000 + 1000),
+      'Management signature did not establish the selected authorization');
       await statusMatches(authorized.body); // Active before requesting or redeeming any browser ticket.
       return authorized.body;
     };
@@ -590,7 +595,7 @@ async function protocolSmoke(server, config, host) {
       const ticket = await api(origin, 'manage/browser', {}, token);
       must(ticket.status === 200 && ticket.body.authorizationExpiresAt === grant.expiresAt, 'Browser ticket changed authorization expiry');
       const ticketExpiry = Date.parse(ticket.body.expiresAt);
-      must(ticketExpiry <= Date.parse(grant.expiresAt) && ticketExpiry > Date.parse(ticket.headers.date) &&
+      must((grant.sessionMinutes === 0 || ticketExpiry <= Date.parse(grant.expiresAt)) && ticketExpiry > Date.parse(ticket.headers.date) &&
         ticketExpiry <= Date.parse(ticket.headers.date) + 61000, 'Browser ticket exceeds one minute or its authorization');
       const url = new URL(ticket.body.url);
       must(url.origin === origin && url.pathname === '/_wol/manage' && !url.search, 'Management ticket origin/path mismatch');
@@ -605,9 +610,13 @@ async function protocolSmoke(server, config, host) {
       const cookieHeader = (redeemed.headers['set-cookie'] || []).find(value => value.startsWith('__Host-roc_session='));
       must(cookieHeader && /;\s*Secure/i.test(cookieHeader) && /;\s*HttpOnly/i.test(cookieHeader) &&
         /;\s*SameSite=Strict/i.test(cookieHeader) && !/;\s*Domain=/i.test(cookieHeader), 'Management session cookie constraints failed');
-      const maxAge = Number(cookieHeader.match(/;\s*Max-Age=(\d+)/i)?.[1]);
-      const cookieExpiry = Date.parse(redeemed.headers.date) + maxAge * 1000;
-      must(maxAge > 0 && Math.abs(cookieExpiry - Date.parse(grant.expiresAt)) <= 2000, 'Browser cookie did not inherit existing authorization expiry');
+      if (grant.sessionMinutes === 0) {
+        must(!/;\s*(?:Max-Age|Expires)=/i.test(cookieHeader), 'Permanent authorization must use a non-deleting session cookie');
+      } else {
+        const maxAge = Number(cookieHeader.match(/;\s*Max-Age=(\d+)/i)?.[1]);
+        const cookieExpiry = Date.parse(redeemed.headers.date) + maxAge * 1000;
+        must(maxAge > 0 && Math.abs(cookieExpiry - Date.parse(grant.expiresAt)) <= 2000, 'Browser cookie did not inherit existing authorization expiry');
+      }
       await statusMatches(grant);
       return cookieHeader.split(';')[0];
     };
@@ -648,9 +657,8 @@ async function protocolSmoke(server, config, host) {
     const pendingTicket = await browserTicket(grant);
     await end(cookie);
     must([401, 409].includes((await api(origin, 'manage/redeem', { ticket: pendingTicket })).status), 'Manual cancellation left an unused browser ticket valid');
-    // Ten device challenge attempts total: one wake auth, four grants, three signature
-    // scope-tamper cases and two invalid durations. Pairing uses the separate global quota.
-    for (const sessionMinutes of [0, 31]) {
+    // Wake authentication and scope-tamper checks share the per-device authentication quota.
+    for (const sessionMinutes of [-1, 31]) {
       const invalid = await api(origin, 'manage/challenge', { origin, sessionMinutes, allowAllDevices: false }, token);
       must(invalid.status === 400, `Invalid management duration ${sessionMinutes} was not rejected`);
     }
@@ -680,6 +688,16 @@ async function protocolSmoke(server, config, host) {
     must([403, 404].includes(reserved.status), 'All-device authorization exposed a reserved agent route');
     cookie = await redeem(await browserTicket(allGrant), allGrant);
     await end(cookie);
+    // Begin added permanent-scope checks in a new quota window without weakening production limits.
+    await new Promise(resolve => setTimeout(resolve, 61_000));
+    for (const allDevices of [false, true]) {
+      const permanent = await authorize(0, allDevices);
+      const anonymous = await request(`${origin}/cgi-bin/luci/`);
+      must(allDevices ? reachesLogin(anonymous) : anonymous.status === 401, 'Permanent authorization ignored its access scope');
+      const permanentCookie = await redeem(await browserTicket(permanent), permanent);
+      must(reachesLogin(await request(`${origin}/cgi-bin/luci/`, { headers: { Cookie: permanentCookie } })), 'Permanent browser session failed');
+      await end(permanentCookie);
+    }
     const shortGrant = await authorize(5, false);
     const oldCookie = await redeem(await browserTicket(shortGrant), shortGrant);
     const oldTicket = await browserTicket(shortGrant);

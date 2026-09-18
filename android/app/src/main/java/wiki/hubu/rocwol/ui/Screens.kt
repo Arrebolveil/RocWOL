@@ -386,7 +386,7 @@ private fun WakePage(model: WolViewModel, state: ScreenState) {
             Text(state.target?.name ?: "DESKTOP-IENBTJG", style = MaterialTheme.typography.titleLarge)
             StatusLine("服务器", state.server, state.server == "可达")
             StatusLine("路由器", when (state.target?.router) { "available" -> "可达"; "unavailable" -> "不可达"; else -> "未知" }, state.target?.router == "available")
-            StatusLine("电脑探测", when (state.target?.reachability) { "reachable" -> "当前已在线"; "unreachable" -> "未响应（不等于已关机）"; else -> "未知" }, state.target?.reachability == "reachable")
+            StatusLine("电脑探测", when (state.target?.reachability) { "reachable" -> "在线"; "unreachable" -> "不在线"; else -> "未知" }, state.target?.reachability == "reachable")
             AnimatedVisibility(state.target?.checkedAt != null, enter = fadeIn(tween(180)) + expandVertically(tween(220)), exit = fadeOut(tween(100)) + shrinkVertically(tween(180))) {
                 state.target?.checkedAt?.let { Text("检测时间：${formatTime(it)}", style = MaterialTheme.typography.bodySmall) }
             }
@@ -396,7 +396,7 @@ private fun WakePage(model: WolViewModel, state: ScreenState) {
     val retryOriginal = state.wake?.let { !it.gatewayConfirmed && it.result in setOf("pending", "unknown") && it.createdAt.isAfter(java.time.Instant.now().minusSeconds(86_400)) } == true
     PrimaryAction(if (retryOriginal) "重试原唤醒请求（相同 ID）" else "唤醒电脑", onClick = model::requestWake, enabled = !state.busy, minHeight = 60.dp)
     LastResult(model, state)
-    Text("仅发送唤醒包，不提供远程关机。网络或探测失败无法证明电脑已经关机。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    Text("仅支持远程唤醒，不提供关机功能。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
 }
 
 @Composable
@@ -418,7 +418,7 @@ private fun LastResult(model: WolViewModel, state: ScreenState) {
             Text("最近结果", style = MaterialTheme.typography.titleMedium)
             MotionText(state.resultText, MaterialTheme.typography.bodyMedium)
             AnimatedVisibility(state.waiting, enter = fadeIn(tween(180)) + expandVertically(tween(240)), exit = fadeOut(tween(100)) + shrinkVertically(tween(200))) {
-                Text("每 3 秒探测，最多等待 90 秒；离开前台停止轮询。", style = MaterialTheme.typography.bodySmall)
+                Text("正在等待上线…", style = MaterialTheme.typography.bodySmall)
             }
             AnimatedVisibility(state.wake != null, enter = fadeIn(tween(180)) + expandVertically(tween(240)), exit = fadeOut(tween(100)) + shrinkVertically(tween(200))) {
                 state.wake?.let { wake ->
@@ -449,6 +449,12 @@ private fun SettingsPage(model: WolViewModel, state: ScreenState, themeMode: The
                     }
                 }
             }
+        }
+    }
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text("安全提醒", style = MaterialTheme.typography.titleMedium)
+            ManagementSwitch("全设备访问警告", "开启“允许所有设备访问”时显示确认。关闭提醒不会开启访问权限。", state.warnAllDevices, !state.busy, model::setWarnAllDevices)
         }
     }
     Card(Modifier.fillMaxWidth()) {
@@ -488,13 +494,14 @@ private fun SettingsPage(model: WolViewModel, state: ScreenState, themeMode: The
 private fun ManagementPage(activity: Activity, model: WolViewModel, state: ScreenState, current: Boolean) {
     var now by remember { mutableStateOf(Instant.now()) }
     var confirmAllDevices by remember { mutableStateOf(false) }
+    var confirmPermanent by remember { mutableStateOf(false) }
     val authorization = state.management
     val lifecycleOwner = LocalLifecycleOwner.current
     LaunchedEffect(authorization?.expiresAt, lifecycleOwner, current) {
         if (!current) return@LaunchedEffect
         lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
             now = Instant.now()
-            val expires = authorization?.expiresAt ?: return@repeatOnLifecycle
+            val expires = authorization?.takeUnless { it.isPermanent }?.expiresAt ?: return@repeatOnLifecycle
             while (now.isBefore(expires)) {
                 delay(1_000)
                 now = Instant.now()
@@ -502,7 +509,7 @@ private fun ManagementPage(activity: Activity, model: WolViewModel, state: Scree
             model.refreshManagement()
         }
     }
-    val active = authorization?.expiresAt?.isAfter(now) == true
+    val active = authorization?.let { it.isPermanent || it.expiresAt.isAfter(now) } == true
     val uncertain = !state.managementKnown && state.managementPending
     val cancelMode = active || uncertain
     Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)) {
@@ -529,14 +536,18 @@ private fun ManagementPage(activity: Activity, model: WolViewModel, state: Scree
             ) { granted ->
                 Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
                     if (granted != null) {
-                        val remaining = java.time.Duration.between(now, granted.expiresAt).seconds.coerceAtLeast(0)
-                        // Do not animate every countdown tick or announce it as a live region.
-                        Text("剩余 ${remaining / 60} 分 ${remaining % 60} 秒", style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.primary)
+                        if (granted.isPermanent) {
+                            Text("永久授权", style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.primary)
+                        } else {
+                            val remaining = java.time.Duration.between(now, granted.expiresAt).seconds.coerceAtLeast(0)
+                            // Do not animate every countdown tick or announce it as a live region.
+                            Text("剩余 ${remaining / 60} 分 ${remaining % 60} 秒", style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.primary)
+                        }
                         Text(if (granted.allowAllDevices) "所有设备可访问 · 仍需 LuCI 登录" else "仅已授权浏览器可访问", style = MaterialTheme.typography.bodyMedium)
-                        Text("到期 ${formatTime(granted.expiresAt)}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(if (granted.isPermanent) "不会自动到期，请用完后取消授权。" else "到期 ${formatTime(granted.expiresAt)}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     } else {
                         Text(
-                            when { !state.paired -> "先到“唤醒”页面配对此手机。"; uncertain -> "未能确认服务器状态。可以刷新，或直接取消本机授权。"; else -> "完成系统认证后开始计时。返回 App 不会结束授权。" },
+                            when { !state.paired -> "先到“唤醒”页面配对此手机。"; uncertain -> "未能确认服务器状态。可以刷新，或直接取消本机授权。"; else -> "完成系统认证后生效。返回 App 不会结束授权。" },
                             style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
@@ -566,30 +577,39 @@ private fun ManagementPage(activity: Activity, model: WolViewModel, state: Scree
             Text("授权时长", style = MaterialTheme.typography.labelLarge)
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Repository.sessionMinutesOptions.forEach { minutes ->
-                    FilterChip(selected = state.sessionMinutes == minutes, onClick = { model.selectSessionMinutes(minutes) },
-                        enabled = !state.busy, label = { Text("${minutes}分钟") })
+                    FilterChip(selected = state.sessionMinutes == minutes, onClick = {
+                        if (minutes == 0 && state.sessionMinutes != 0) confirmPermanent = true else model.selectSessionMinutes(minutes)
+                    }, enabled = !state.busy, label = { Text(if (minutes == 0) "永久" else "${minutes}分钟") })
                 }
             }
             HorizontalDivider()
             ManagementSwitch("自动打开浏览器", "认证成功后，直接进入默认浏览器。", state.autoOpenBrowser, !state.busy, model::setAutoOpenBrowser)
             HorizontalDivider()
-            ManagementSwitch("允许所有设备访问", "临时向所有设备开放此线路的 LuCI 登录页。", state.allowAllDevices, !state.busy) {
-                if (it) confirmAllDevices = true else model.setAllowAllDevices(false)
+            ManagementSwitch("允许所有设备访问", "向所有设备开放此线路的 LuCI 登录页；关闭会取消本机当前授权。", state.allowAllDevices || authorization?.allowAllDevices == true, !state.busy) {
+                if (it && state.warnAllDevices) confirmAllDevices = true else model.setAllowAllDevices(it)
             }
             AnimatedVisibility(state.allowAllDevices, enter = fadeIn(tween(180)) + expandVertically(tween(240, easing = FastOutSlowInEasing)), exit = fadeOut(tween(100)) + shrinkVertically(tween(200, easing = FastOutSlowInEasing))) {
                 Text("开启后，知道管理网址的任何人都能访问登录页。路由器密码仍然必需。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
             }
-            Text("时长和访问范围只对下次授权生效，不延长或改变当前授权。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("时长和开启全设备访问只对下次授权生效；关闭全设备访问会立即请求取消本机当前授权。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
-    Text("取消授权会关闭本机发起的管理权限，其他手机的授权不受影响。离线时无法保证立即取消，到期由服务器关闭；已加载的网页不会被擦除。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    Text("取消只影响本机发起的授权，不影响其他手机。离线时无法立即取消；永久授权不会自动到期。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     MotionAlertDialog(
         visible = confirmAllDevices && current,
         onDismissRequest = { confirmAllDevices = false },
         icon = Icons.Default.Warning, title = "允许所有设备访问？",
-        text = "下次授权期间，任何能访问此管理网址的人都能进入 LuCI 登录页，不需要 App 配对。仍需路由器账号密码。\n\n到期或取消本机授权后关闭这次访问权限。",
+        text = "下次授权期间，任何知道此管理网址的人都能进入 LuCI 登录页，仍需路由器账号密码。\n\n关闭此开关或取消本机授权可结束这次权限；已加载的网页不会被清除。可在设置中关闭本提醒。",
         confirmText = "允许", onConfirm = { confirmAllDevices = false; model.setAllowAllDevices(true) },
         dismissText = "保持关闭", enabled = !state.busy
+    )
+    MotionAlertDialog(
+        visible = confirmPermanent && current,
+        onDismissRequest = { confirmPermanent = false },
+        icon = Icons.Default.Warning, title = "使用永久授权？",
+        text = "永久授权不会自动到期，需要手动取消或撤销设备；服务重启也会清除授权。\n\n若同时允许所有设备访问，管理登录页将持续向公网开放。此设置不会改变当前授权。",
+        confirmText = "选择永久", onConfirm = { confirmPermanent = false; model.selectSessionMinutes(0) },
+        dismissText = "取消", enabled = !state.busy
     )
 }
 

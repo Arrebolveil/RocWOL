@@ -233,8 +233,9 @@ func (a *Agent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/_roc-agent/") || r.URL.Path == "/_roc-agent" {
-		if r.URL.RawQuery != "" {
-			writeError(w, 400, "invalid_request", "Agent API does not accept query parameters.", "")
+		fresh := r.URL.Path == apiPrefix+"status" && r.Method == http.MethodGet && r.URL.RawQuery == "fresh=1"
+		if r.URL.RawQuery != "" && !fresh {
+			writeError(w, 400, "invalid_request", "Unsupported agent API query parameters.", "")
 			return
 		}
 		switch {
@@ -243,7 +244,7 @@ func (a *Agent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case strings.HasPrefix(r.URL.Path, apiPrefix+"wake/") && r.Method == http.MethodGet:
 			a.query(w, r, strings.TrimPrefix(r.URL.Path, apiPrefix+"wake/"))
 		case r.URL.Path == apiPrefix+"status" && r.Method == http.MethodGet:
-			writeJSON(w, 200, a.probe())
+			writeJSON(w, 200, a.probe(fresh))
 		default:
 			writeError(w, 404, "not_found", "Resource not found.", "")
 		}
@@ -373,10 +374,10 @@ func (a *Agent) query(w http.ResponseWriter, r *http.Request, id string) {
 	writeJSON(w, 200, result)
 }
 
-func (a *Agent) probe() Status {
+func (a *Agent) probe(fresh bool) Status {
 	a.statusMu.Lock()
 	defer a.statusMu.Unlock()
-	if !a.status.CheckedAt.IsZero() && time.Since(a.status.CheckedAt) < 3*time.Second {
+	if !fresh && !a.status.CheckedAt.IsZero() && time.Since(a.status.CheckedAt) < 3*time.Second {
 		return a.status
 	}
 	ctx, cancel := context.WithTimeout(a.ctx, 2*time.Second)

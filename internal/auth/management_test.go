@@ -272,3 +272,189 @@ func TestBrowserTicketReplacementAndRateLimit(t *testing.T) {
 		t.Fatalf("ticket limit changed authorization: %+v %v", status, err)
 	}
 }
+
+func TestPermanentManagementLifecycle(t *testing.T) {
+	for _, mode := range []string{"end", "revoke", "replacement", "close"} {
+		t.Run(mode, func(t *testing.T) {
+			s := state(t)
+			k, otherK := newKeys(t), newKeys(t)
+			owner, other := pair(t, s, k), pair(t, s, otherK)
+			origin := "https://wol.hubu.wiki"
+			now := s.now()
+			s.now = func() time.Time { return now }
+			grant := authorize(t, s, k, owner.DeviceID, origin, 0, true)
+			if !grant.Active || grant.SessionMinutes != 0 || !grant.ExpiresAt.IsZero() {
+				t.Fatalf("permanent authorization has a deadline: %+v", grant)
+			}
+			cookie, expires, err := s.Redeem(browserTicket(t, s, owner.DeviceID, origin), origin)
+			if err != nil || !expires.IsZero() {
+				t.Fatalf("permanent browser session: %v %v", expires, err)
+			}
+			var contexts []context.Context
+			for _, session := range []string{"", cookie} {
+				ctx, release, err := s.ProxyContext(context.Background(), session, origin)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer release()
+				if _, hasDeadline := ctx.Deadline(); hasDeadline || ctx.Err() != nil {
+					t.Fatal("permanent proxy context has an expiry")
+				}
+				contexts = append(contexts, ctx)
+			}
+			now = now.AddDate(200, 0, 0)
+			status, err := s.ManagementStatus(owner.DeviceID)
+			if err != nil || !status.Active || !status.ExpiresAt.IsZero() {
+				t.Fatalf("cleanup expired permanent grant: %+v %v", status, err)
+			}
+			_, _, _, err = s.TokenContext(context.Background(), owner.AccessToken)
+			wantFailure(t, err, 401)
+			ctx, release, err := s.ProxyContext(context.Background(), cookie, origin)
+			if err != nil || ctx.Err() != nil {
+				t.Fatalf("cleanup removed permanent browser session: %v", err)
+			}
+			defer release()
+			contexts = append(contexts, ctx)
+			pending := browserTicket(t, s, owner.DeviceID, origin)
+			challenge, err := s.ManageChallenge(owner.DeviceID, origin, 0, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			authorize(t, s, otherK, other.DeviceID, origin, 0, false)
+			otherCookie, _, err := s.Redeem(browserTicket(t, s, other.DeviceID, origin), origin)
+			if err != nil {
+				t.Fatal(err)
+			}
+			otherCtx, releaseOther, err := s.ProxyContext(context.Background(), otherCookie, origin)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer releaseOther()
+			switch mode {
+			case "end":
+				err = s.EndManagement(owner.DeviceID)
+			case "revoke":
+				err = s.Revoke(owner.DeviceID)
+			case "replacement":
+				authorize(t, s, k, owner.DeviceID, "https://roc.hubu.wiki", 10, false)
+			case "close":
+				s.Close()
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, ctx := range contexts {
+				if ctx.Err() != context.Canceled {
+					t.Fatal("permanent request survived authorization cancellation")
+				}
+			}
+			if (otherCtx.Err() != nil) != (mode == "close") {
+				t.Fatal("cancellation affected unrelated owner")
+			}
+			for _, session := range []string{"", cookie} {
+				_, _, err = s.ProxyContext(context.Background(), session, origin)
+				wantFailure(t, err, 401)
+			}
+			_, _, err = s.Redeem(pending, origin)
+			wantFailure(t, err, 409)
+			msg := protocol.ManageMessage(owner.DeviceID, challenge.ChallengeID, challenge.Nonce, origin, 0, true)
+			_, err = s.AuthorizeManagement(owner.DeviceID, challenge.ChallengeID, sign(t, k.manage, msg), origin)
+			wantFailure(t, err, 409)
+		})
+	}
+}
+
+func TestPermanentAuthorizationStillBoundsTicketsAndChallenges(t *testing.T) {
+	s := state(t)
+	k := newKeys(t)
+	owner := pair(t, s, k)
+	origin := "https://wol.hubu.wiki"
+	now := s.now()
+	s.now = func() time.Time { return now }
+	authorize(t, s, k, owner.DeviceID, origin, 0, false)
+	link, err := s.ManagementBrowser(owner.DeviceID, origin)
+	if err != nil || !link.ExpiresAt.Equal(now.Add(time.Minute)) || !link.AuthorizationExpiresAt.IsZero() {
+		t.Fatalf("permanent authorization made ticket permanent: %+v %v", link, err)
+	}
+	c, err := s.ManageChallenge(owner.DeviceID, origin, 0, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Minute)
+	_, _, err = s.Redeem(strings.TrimPrefix(link.URL, origin+"/_wol/manage#t="), origin)
+	wantFailure(t, err, 409)
+	_, err = s.AuthorizeManagement(owner.DeviceID, c.ChallengeID, sign(t, k.manage, protocol.ManageMessage(owner.DeviceID, c.ChallengeID, c.Nonce, origin, 0, true)), origin)
+	wantFailure(t, err, 409)
+	cookie, _, err := s.Redeem(browserTicket(t, s, owner.DeviceID, origin), origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.AddDate(200, 0, 0)
+	_, release, err := s.ProxyContext(context.Background(), cookie, origin)
+	if err != nil {
+		t.Fatal("expired ticket or challenge canceled existing grant:", err)
+	}
+	defer release()
+}
+
+func TestPermanentManagementRejectsAlteredSignature(t *testing.T) {
+	for _, mode := range []string{"duration", "scope", "origin", "wake-key"} {
+		t.Run(mode, func(t *testing.T) {
+			s := state(t)
+			k := newKeys(t)
+			owner := pair(t, s, k)
+			origin := "https://wol.hubu.wiki"
+			c, err := s.ManageChallenge(owner.DeviceID, origin, 0, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			minutes, all, signedOrigin, key := 0, true, origin, k.manage
+			switch mode {
+			case "duration":
+				minutes = 30
+			case "scope":
+				all = false
+			case "origin":
+				signedOrigin = "https://roc.hubu.wiki"
+			case "wake-key":
+				key = k.wake
+			}
+			msg := protocol.ManageMessage(owner.DeviceID, c.ChallengeID, c.Nonce, signedOrigin, minutes, all)
+			_, err = s.AuthorizeManagement(owner.DeviceID, c.ChallengeID, sign(t, key, msg), origin)
+			wantFailure(t, err, 403)
+			_, _, err = s.ProxyContext(context.Background(), "", origin)
+			wantFailure(t, err, 401)
+		})
+	}
+}
+
+func TestAnonymousOwnerPrefersFiniteDeadlineOverPermanent(t *testing.T) {
+	s := state(t)
+	k, otherK := newKeys(t), newKeys(t)
+	owner, other := pair(t, s, k), pair(t, s, otherK)
+	origin := "https://wol.hubu.wiki"
+	authorize(t, s, k, owner.DeviceID, origin, 0, true)
+	finite := authorize(t, s, otherK, other.DeviceID, origin, 5, true)
+	ctx, release, err := s.ProxyContext(context.Background(), "", origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	if deadline, ok := ctx.Deadline(); !ok || !deadline.Equal(finite.ExpiresAt) {
+		t.Fatalf("anonymous request chose permanent owner over finite deadline: %v", deadline)
+	}
+	if err := s.EndManagement(other.DeviceID); err != nil {
+		t.Fatal(err)
+	}
+	if ctx.Err() != context.Canceled {
+		t.Fatal("finite owner's request survived revocation")
+	}
+	remaining, releaseRemaining, err := s.ProxyContext(context.Background(), "", origin)
+	if err != nil {
+		t.Fatal("unrelated permanent owner was revoked:", err)
+	}
+	defer releaseRemaining()
+	if _, ok := remaining.Deadline(); ok || remaining.Err() != nil {
+		t.Fatal("remaining permanent owner has a deadline")
+	}
+}

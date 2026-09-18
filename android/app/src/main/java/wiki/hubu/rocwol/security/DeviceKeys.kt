@@ -83,11 +83,15 @@ class DeviceKeys {
                         .setTitle(if (sessionMinutes == null) "授权此手机" else "授权路由器管理")
                         .setSubtitle(when {
                             sessionMinutes == null -> "验证管理密钥后才能完成双密钥配对"
+                            sessionMinutes == 0 && allowAllDevices -> "永久授权：允许所有设备访问当前线路"
+                            sessionMinutes == 0 -> "永久授权：仅限本机打开的浏览器"
                             allowAllDevices -> "允许所有设备访问当前线路，授权 $sessionMinutes 分钟"
                             else -> "仅授权本机打开的浏览器，授权 $sessionMinutes 分钟"
                         })
                         .setDescription(when {
                             sessionMinutes == null -> "此认证用于注册管理密钥，不会开启路由器管理授权。"
+                            sessionMinutes == 0 -> (if (allowAllDevices) "任何设备均可通过当前线路访问 LuCI 登录页，仍需 LuCI 登录。" else "仅本机浏览器可访问，仍需 LuCI 登录。") +
+                                "授权无自动到期时间，返回 App 不会取消。请在 App 手动取消；撤销设备或网关重启也会使授权失效。"
                             allowAllDevices -> "授权期间，任何设备均可通过当前线路访问 LuCI 登录页，仍需 LuCI 登录。返回 App 不会取消授权；到期自动失效，也可在 App 手动取消。"
                             else -> "授权从本次签名被服务器接受时开始，仍需 LuCI 登录。返回 App 不会取消授权；到期自动失效，也可在 App 手动取消。"
                         })

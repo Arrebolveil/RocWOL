@@ -258,7 +258,12 @@ func (g *Gateway) api(w http.ResponseWriter, r *http.Request, origin string) {
 			respondError(w, e)
 			return
 		}
-		http.SetCookie(w, &http.Cookie{Name: "__Host-roc_session", Value: cookie, Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode, Expires: expires, MaxAge: int(time.Until(expires).Seconds())})
+		sessionCookie := &http.Cookie{Name: "__Host-roc_session", Value: cookie, Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode}
+		if !expires.IsZero() {
+			sessionCookie.Expires = expires
+			sessionCookie.MaxAge = int(time.Until(expires).Seconds())
+		}
+		http.SetCookie(w, sessionCookie)
 		protocol.JSON(w, 200, map[string]string{"redirect": "/cgi-bin/luci/"})
 		return
 	}

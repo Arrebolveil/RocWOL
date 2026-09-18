@@ -58,7 +58,7 @@ func New(db *store.Store) *State {
 func (s *State) clean() {
 	now := s.now()
 	for device, g := range s.management {
-		if !g.ExpiresAt.After(now) {
+		if !g.ExpiresAt.IsZero() && !g.ExpiresAt.After(now) {
 			s.closeManagement(device)
 		}
 	}
@@ -67,12 +67,18 @@ func (s *State) clean() {
 			delete(s.challenges, k)
 		}
 	}
-	for _, m := range []map[string]grant{s.tokens, s.tickets, s.sessions} {
+	for _, m := range []map[string]grant{s.tokens, s.tickets} {
 		for k, v := range m {
 			if !v.Expires.After(now) {
 				delete(m, k)
 				s.cancelSession(k)
 			}
+		}
+	}
+	for key, g := range s.sessions {
+		if !g.Expires.IsZero() && !g.Expires.After(now) {
+			delete(s.sessions, key)
+			s.cancelSession(key)
 		}
 	}
 	for k, v := range s.rates {
@@ -267,7 +273,7 @@ func (s *State) TokenContext(parent context.Context, token string) (context.Cont
 func (s *State) ManageChallenge(device, origin string, sessionMinutes int, allowAllDevices bool) (protocol.Challenge, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if sessionMinutes != 5 && sessionMinutes != 10 && sessionMinutes != 15 && sessionMinutes != 30 {
+	if sessionMinutes != 0 && sessionMinutes != 5 && sessionMinutes != 10 && sessionMinutes != 15 && sessionMinutes != 30 {
 		return protocol.Challenge{}, fail(400, "invalid_request")
 	}
 	if e := s.challengeLimit(device); e != nil {
@@ -296,10 +302,14 @@ func (s *State) AuthorizeManagement(device, id, sig, origin string) (protocol.Ma
 	}
 	s.closeManagement(device)
 	s.clearManageChallenges(device)
+	var expires time.Time
+	if c.SessionMinutes != 0 {
+		expires = s.now().Add(min(time.Duration(c.SessionMinutes)*time.Minute, s.MaxSessionTTL, 30*time.Minute))
+	}
 	g := managementGrant{
 		ManagementAuthorization: protocol.ManagementAuthorization{
 			Active: true, Origin: origin, SessionMinutes: c.SessionMinutes, AllowAllDevices: c.AllowAllDevices,
-			ExpiresAt: s.now().Add(min(time.Duration(c.SessionMinutes)*time.Minute, s.MaxSessionTTL, 30*time.Minute)),
+			ExpiresAt: expires,
 		},
 		Key: "manage:" + protocol.Random(32),
 	}
@@ -338,7 +348,10 @@ func (s *State) ManagementBrowser(device, origin string) (protocol.ManagementBro
 		}
 	}
 	ticket := protocol.Random(32)
-	expires := minTime(s.now().Add(time.Minute), g.ExpiresAt)
+	expires := s.now().Add(time.Minute)
+	if !g.ExpiresAt.IsZero() {
+		expires = minTime(expires, g.ExpiresAt)
+	}
 	s.tickets[protocol.Hash(ticket)] = grant{Device: device, Origin: origin, Authorization: g.Key, Expires: expires}
 	return protocol.ManagementBrowser{URL: origin + "/_wol/manage#t=" + ticket, ExpiresAt: expires, AuthorizationExpiresAt: g.ExpiresAt}, nil
 }
@@ -395,7 +408,7 @@ func (s *State) ProxyContext(parent context.Context, cookie, origin string) (con
 	s.clean()
 	key := protocol.Hash(cookie)
 	g, ok := s.sessions[key]
-	if ok && g.Origin == origin && g.Expires.After(s.now()) {
+	if ok && g.Origin == origin && (g.Expires.IsZero() || g.Expires.After(s.now())) {
 		authorization, exists := s.management[g.Device]
 		if exists && authorization.Key == g.Authorization && authorization.Origin == origin {
 			if _, e := s.validDevice(g.Device); e == nil {
@@ -405,7 +418,7 @@ func (s *State) ProxyContext(parent context.Context, cookie, origin string) (con
 		}
 	}
 	// Multiple owners may authorize this origin. Attribute each admitted request
-	// to one owner, preferring the earliest expiry, so cancellation is scoped.
+	// to one owner, preferring the earliest finite expiry, so cancellation is scoped.
 	var owner string
 	var selected managementGrant
 	for device, authorization := range s.management {
@@ -415,7 +428,7 @@ func (s *State) ProxyContext(parent context.Context, cookie, origin string) (con
 		if _, e := s.validDevice(device); e != nil {
 			continue
 		}
-		if owner == "" || authorization.ExpiresAt.Before(selected.ExpiresAt) || authorization.ExpiresAt.Equal(selected.ExpiresAt) && device < owner {
+		if owner == "" || !authorization.ExpiresAt.IsZero() && (selected.ExpiresAt.IsZero() || authorization.ExpiresAt.Before(selected.ExpiresAt)) || authorization.ExpiresAt.Equal(selected.ExpiresAt) && device < owner {
 			owner, selected = device, authorization
 		}
 	}
@@ -428,7 +441,13 @@ func (s *State) ProxyContext(parent context.Context, cookie, origin string) (con
 
 // Caller holds mu; both bearer and cookie grants share revocation tracking.
 func (s *State) grantContext(parent context.Context, key string, g grant) (context.Context, func()) {
-	ctx, cancel := context.WithDeadline(parent, g.Expires)
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if g.Expires.IsZero() {
+		ctx, cancel = context.WithCancel(parent)
+	} else {
+		ctx, cancel = context.WithDeadline(parent, g.Expires)
+	}
 	id := protocol.ID()
 	if s.active[key] == nil {
 		s.active[key] = map[string]context.CancelFunc{}

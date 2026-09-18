@@ -335,6 +335,94 @@ func TestMTLSRequiresGatewayIdentityAndTrustedServer(t *testing.T) {
 	}
 }
 
+func TestManualStatusRefreshBypassesProbeCache(t *testing.T) {
+	f := agentFixture(t)
+	calls := 0
+	var completed time.Time
+	a := openTestAgent(t, f, runnerFunc(func(_ context.Context, path string, args ...string) error {
+		if path != f.config.PingPath || strings.Join(args, " ") != "-c 1 -W 1 192.168.2.100" {
+			t.Fatal("status probe changed command:", path, args)
+		}
+		calls++
+		completed = time.Now().UTC()
+		if calls == 1 {
+			return nil
+		}
+		return errors.New("probe unavailable")
+	}))
+	readStatus := func(path string) Status {
+		t.Helper()
+		w := request(a, f, "GET", path, "")
+		var status Status
+		if err := json.Unmarshal(w.Body.Bytes(), &status); err != nil || w.Code != 200 {
+			t.Fatalf("status: %d %s", w.Code, w.Body.String())
+		}
+		return status
+	}
+	first := readStatus(apiPrefix + "status")
+	if calls != 1 || first.Reachability != "reachable" || first.CheckedAt.Before(completed) {
+		t.Fatalf("initial probe did not report completion: %+v", first)
+	}
+	cached := readStatus(apiPrefix + "status")
+	if calls != 1 || cached != first {
+		t.Fatalf("ordinary status bypassed cache: %+v", cached)
+	}
+	fresh := readStatus(apiPrefix + "status?fresh=1")
+	if calls != 2 || fresh.Reachability != "unknown" || fresh.CheckedAt.Before(completed) {
+		t.Fatalf("manual refresh returned cached result or start time: %+v", fresh)
+	}
+	cached = readStatus(apiPrefix + "status")
+	if calls != 2 || cached != fresh {
+		t.Fatalf("manual refresh did not replace cache: %+v", cached)
+	}
+}
+
+func TestConcurrentFreshStatusProbesAreSerialized(t *testing.T) {
+	f := agentFixture(t)
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	var once sync.Once
+	defer once.Do(func() { close(release) })
+	a := openTestAgent(t, f, runnerFunc(func(ctx context.Context, _ string, _ ...string) error {
+		started <- struct{}{}
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}))
+	done := make(chan *httptest.ResponseRecorder, 2)
+	go func() { done <- request(a, f, "GET", apiPrefix+"status?fresh=1", "") }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first probe did not start")
+	}
+	go func() { done <- request(a, f, "GET", apiPrefix+"status?fresh=1", "") }()
+	select {
+	case <-started:
+		t.Fatal("manual status probes overlapped")
+	case <-time.After(50 * time.Millisecond):
+	}
+	once.Do(func() { close(release) })
+	for range 2 {
+		select {
+		case w := <-done:
+			if w.Code != 200 {
+				t.Fatal("status request failed:", w.Code)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("serialized status request did not complete")
+		}
+	}
+	select {
+	case <-started:
+	default:
+		t.Fatal("second manual refresh reused first probe")
+	}
+}
+
 func TestLedgerCapacityDoesNotEvictLiveDeduplication(t *testing.T) {
 	l, err := openLedger(filepath.Join(t.TempDir(), "agent.db"))
 	if err != nil {
