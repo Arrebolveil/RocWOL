@@ -33,6 +33,11 @@ func (g *Gateway) target(w http.ResponseWriter, r *http.Request, device string) 
 	router := "unavailable"
 	path := "/_roc-agent/v1/status"
 	if r.URL.Query().Get("fresh") == "1" {
+		if !g.admitFresh(device) {
+			w.Header().Set("Retry-After", "1")
+			protocol.Fail(w, 429, "rate_limited")
+			return
+		}
 		path += "?fresh=1"
 	}
 	resp, e := g.agentRequest(r, "GET", path, nil)
@@ -50,6 +55,24 @@ func (g *Gateway) target(w http.ResponseWriter, r *http.Request, device string) 
 		return
 	}
 	protocol.JSON(w, 200, map[string]any{"targetId": "desktop", "name": "DESKTOP-IENBTJG", "mac": "B0:25:AA:83:C6:EF", "ip": "192.168.2.100", "router": router, "reachability": status.Reachability, "checkedAt": status.CheckedAt, "lastWake": last})
+}
+func (g *Gateway) admitFresh(device string) bool {
+	g.freshMu.Lock()
+	defer g.freshMu.Unlock()
+	now := time.Now()
+	for key, last := range g.freshRates {
+		if now.Sub(last) >= time.Second {
+			delete(g.freshRates, key)
+		}
+	}
+	if _, limited := g.freshRates[device]; limited || len(g.freshRates) >= 1024 {
+		return false
+	}
+	if g.freshRates == nil {
+		g.freshRates = make(map[string]time.Time)
+	}
+	g.freshRates[device] = now
+	return true
 }
 func (g *Gateway) wake(w http.ResponseWriter, r *http.Request, device, id string, post bool) {
 	g.wakeMu.Lock()

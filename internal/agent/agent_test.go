@@ -423,6 +423,194 @@ func TestConcurrentFreshStatusProbesAreSerialized(t *testing.T) {
 	}
 }
 
+func TestCanceledQueuedStatusRequestDoesNotProbe(t *testing.T) {
+	for _, mode := range []string{"cancel", "deadline"} {
+		t.Run(mode, func(t *testing.T) {
+			f := agentFixture(t)
+			started, release := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			defer once.Do(func() { close(release) })
+			var calls atomic.Int32
+			a := openTestAgent(t, f, runnerFunc(func(ctx context.Context, _ string, _ ...string) error {
+				if calls.Add(1) == 1 {
+					close(started)
+					select {
+					case <-release:
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				}
+				return nil
+			}))
+			firstDone := make(chan *httptest.ResponseRecorder, 1)
+			go func() { firstDone <- request(a, f, "GET", apiPrefix+"status?fresh=1", "") }()
+			select {
+			case <-started:
+			case <-time.After(time.Second):
+				t.Fatal("first probe did not start")
+			}
+			timeout := time.Hour
+			if mode == "deadline" {
+				timeout = 100 * time.Millisecond
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+			r := httptest.NewRequest("GET", apiPrefix+"status?fresh=1", nil).WithContext(ctx)
+			r.TLS = f.state
+			queuedDone := make(chan struct{})
+			entered := make(chan struct{})
+			go func() {
+				close(entered)
+				a.ServeHTTP(httptest.NewRecorder(), r)
+				close(queuedDone)
+			}()
+			<-entered
+			if mode == "cancel" {
+				cancel()
+			}
+			<-ctx.Done()
+			select {
+			case <-queuedDone:
+			case <-time.After(time.Second):
+				t.Error("abandoned request waited for the active probe")
+			}
+			once.Do(func() { close(release) })
+			select {
+			case w := <-firstDone:
+				if w.Code != 200 {
+					t.Fatalf("live probe failed: %d %s", w.Code, w.Body.String())
+				}
+			case <-time.After(time.Second):
+				t.Fatal("live probe did not complete")
+			}
+			select {
+			case <-queuedDone:
+			case <-time.After(time.Second):
+				t.Fatal("abandoned request did not return")
+			}
+			if calls.Load() != 1 {
+				t.Fatalf("abandoned request ran a delayed probe: %d calls", calls.Load())
+			}
+		})
+	}
+}
+
+func TestCanceledActiveStatusRequestPreservesCache(t *testing.T) {
+	for _, mode := range []string{"cancel", "deadline"} {
+		t.Run(mode, func(t *testing.T) {
+			f := agentFixture(t)
+			started, release := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			defer once.Do(func() { close(release) })
+			var calls atomic.Int32
+			a := openTestAgent(t, f, runnerFunc(func(ctx context.Context, _ string, _ ...string) error {
+				if calls.Add(1) == 2 {
+					close(started)
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-release:
+						return errors.New("probe interrupted")
+					}
+				}
+				return nil
+			}))
+			first := request(a, f, "GET", apiPrefix+"status", "")
+			if first.Code != 200 || !strings.Contains(first.Body.String(), `"reachability":"reachable"`) {
+				t.Fatalf("initial status failed: %d %s", first.Code, first.Body.String())
+			}
+			timeout := time.Hour
+			if mode == "deadline" {
+				timeout = 100 * time.Millisecond
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+			r := httptest.NewRequest("GET", apiPrefix+"status?fresh=1", nil).WithContext(ctx)
+			r.TLS = f.state
+			done := make(chan struct{})
+			go func() {
+				a.ServeHTTP(httptest.NewRecorder(), r)
+				close(done)
+			}()
+			select {
+			case <-started:
+			case <-time.After(time.Second):
+				t.Fatal("manual probe did not start")
+			}
+			if mode == "cancel" {
+				cancel()
+			}
+			<-ctx.Done()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Error("active probe ignored caller cancellation")
+			}
+			once.Do(func() { close(release) })
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("interrupted probe did not return")
+			}
+			cached := request(a, f, "GET", apiPrefix+"status", "")
+			if cached.Code != 200 || cached.Body.String() != first.Body.String() || calls.Load() != 2 {
+				t.Fatalf("canceled probe replaced last good cache: calls=%d status=%d body=%s", calls.Load(), cached.Code, cached.Body.String())
+			}
+			fresh := request(a, f, "GET", apiPrefix+"status?fresh=1", "")
+			if fresh.Code != 200 || calls.Load() != 3 || !strings.Contains(fresh.Body.String(), `"reachability":"reachable"`) {
+				t.Fatalf("live manual refresh did not run a new probe: calls=%d status=%d body=%s", calls.Load(), fresh.Code, fresh.Body.String())
+			}
+		})
+	}
+}
+
+func TestStatusShutdownCancelsActiveAndQueuedProbes(t *testing.T) {
+	f := agentFixture(t)
+	started := make(chan struct{})
+	var calls atomic.Int32
+	a := openTestAgent(t, f, runnerFunc(func(ctx context.Context, _ string, _ ...string) error {
+		if calls.Add(1) == 1 {
+			close(started)
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}))
+	done := make(chan struct{}, 2)
+	go func() {
+		request(a, f, "GET", apiPrefix+"status?fresh=1", "")
+		done <- struct{}{}
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("active probe did not start")
+	}
+	go func() {
+		request(a, f, "GET", apiPrefix+"status?fresh=1", "")
+		done <- struct{}{}
+	}()
+	closed := make(chan error, 1)
+	go func() { closed <- a.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not cancel status requests")
+	}
+	for range 2 {
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("status request survived shutdown")
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("shutdown dispatched a queued probe: %d calls", calls.Load())
+	}
+}
+
 func TestLedgerCapacityDoesNotEvictLiveDeduplication(t *testing.T) {
 	l, err := openLedger(filepath.Join(t.TempDir(), "agent.db"))
 	if err != nil {

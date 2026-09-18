@@ -620,3 +620,75 @@ func TestTargetRefreshForwardsOnlyExplicitFreshRequest(t *testing.T) {
 		}
 	}
 }
+
+func TestFreshStatusAdmissionLimitsOnlyRequestingDevice(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	defer once.Do(func() { close(release) })
+	var freshCalls, cachedCalls atomic.Int32
+	g := fixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("fresh") == "1" {
+			if freshCalls.Add(1) == 1 {
+				close(started)
+				select {
+				case <-release:
+				case <-r.Context().Done():
+					return
+				}
+			}
+		} else {
+			cachedCalls.Add(1)
+		}
+		now := time.Now().UTC()
+		protocol.JSON(w, 200, protocol.Status{TargetID: "desktop", Reachability: "reachable", CheckedAt: &now})
+	})
+	id, other := identity(t, g), identity(t, g)
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { firstDone <- request(g, "GET", "/_wol/v1/target?fresh=1", id.AccessToken, "", "") }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first fresh status request did not reach agent")
+	}
+	floodDone := make(chan *httptest.ResponseRecorder, 8)
+	for range 8 {
+		go func() { floodDone <- request(g, "GET", "/_wol/v1/target?fresh=1", id.AccessToken, "", "") }()
+	}
+	for range 8 {
+		select {
+		case w := <-floodDone:
+			if w.Code != 429 || w.Header().Get("Retry-After") != "1" || !strings.Contains(w.Body.String(), `"code":"rate_limited"`) {
+				t.Errorf("fresh flood was not rejected: status=%d retry=%q body=%s", w.Code, w.Header().Get("Retry-After"), w.Body.String())
+			}
+		case <-time.After(time.Second):
+			t.Fatal("fresh flood waited for the active upstream request")
+		}
+	}
+	for _, path := range []string{"/_wol/v1/target", "/_wol/v1/target?fresh=0"} {
+		w := request(g, "GET", path, id.AccessToken, "", "")
+		if w.Code != 200 || !strings.Contains(w.Body.String(), `"reachability":"reachable"`) {
+			t.Fatalf("fresh limit blocked a cached query: %d %s", w.Code, w.Body.String())
+		}
+	}
+	w := request(g, "GET", "/_wol/v1/target?fresh=1", other.AccessToken, "", "")
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"reachability":"reachable"`) {
+		t.Fatalf("fresh limit blocked another device: %d %s", w.Code, w.Body.String())
+	}
+	once.Do(func() { close(release) })
+	select {
+	case w := <-firstDone:
+		if w.Code != 200 {
+			t.Fatalf("accepted fresh request failed: %d %s", w.Code, w.Body.String())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("accepted fresh request did not complete")
+	}
+	if freshCalls.Load() != 2 || cachedCalls.Load() != 2 {
+		t.Fatalf("incorrect upstream admissions: fresh=%d cached=%d", freshCalls.Load(), cachedCalls.Load())
+	}
+	time.Sleep(time.Second)
+	w = request(g, "GET", "/_wol/v1/target?fresh=1", id.AccessToken, "", "")
+	if w.Code != 200 || freshCalls.Load() != 3 {
+		t.Fatalf("fresh admission did not reset: calls=%d status=%d body=%s", freshCalls.Load(), w.Code, w.Body.String())
+	}
+}

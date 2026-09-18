@@ -18,14 +18,16 @@ import (
 )
 
 type Gateway struct {
-	cfg       Config
-	DB        *store.Store
-	Auth      *auth.State
-	client    *http.Client
-	proxy     *httputil.ReverseProxy
-	origins   map[string]string
-	wakeMu    sync.Mutex
-	wakeRates map[string][]time.Time
+	cfg        Config
+	DB         *store.Store
+	Auth       *auth.State
+	client     *http.Client
+	proxy      *httputil.ReverseProxy
+	origins    map[string]string
+	wakeMu     sync.Mutex
+	wakeRates  map[string][]time.Time
+	freshMu    sync.Mutex
+	freshRates map[string]time.Time
 }
 
 func New(c Config) (*Gateway, error) {

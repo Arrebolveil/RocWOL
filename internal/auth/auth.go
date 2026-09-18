@@ -100,15 +100,24 @@ func (s *State) rate(key string, max int) bool {
 	s.rates[key] = w
 	return true
 }
+
+// Invalid public requests must not spend another client's admission budget.
+// A single bucket also avoids allocating rate entries for attacker-chosen IDs.
+func (s *State) rejectPublic(err error) error {
+	if !s.rate("invalid", 60) {
+		return fail(429, "rate_limited")
+	}
+	return err
+}
 func (s *State) challengeLimit(device string) error {
 	s.clean()
-	if !s.rate("global", 60) {
+	if len(s.challenges) >= 1024 {
 		return fail(429, "rate_limited")
 	}
 	if device != "" && !s.rate("device:"+device, 10) {
 		return fail(429, "rate_limited")
 	}
-	if len(s.challenges) >= 1024 {
+	if !s.rate("global", 60) {
 		return fail(429, "rate_limited")
 	}
 	return nil
@@ -128,7 +137,7 @@ func (s *State) newChallenge(c challenge, ttl time.Duration) protocol.Challenge 
 	s.challenges[c.ChallengeID] = c
 	return c.Challenge
 }
-func (s *State) consume(id, kind, device string) (challenge, error) {
+func (s *State) lookupChallenge(id, kind, device string) (challenge, error) {
 	c, ok := s.challenges[id]
 	if !ok || !c.ExpiresAt.After(s.now()) {
 		delete(s.challenges, id)
@@ -136,6 +145,13 @@ func (s *State) consume(id, kind, device string) (challenge, error) {
 	}
 	if c.Kind != kind || c.Device != device {
 		return c, fail(403, "forbidden")
+	}
+	return c, nil
+}
+func (s *State) consume(id, kind, device string) (challenge, error) {
+	c, err := s.lookupChallenge(id, kind, device)
+	if err != nil {
+		return c, err
 	}
 	delete(s.challenges, id)
 	return c, nil
@@ -163,11 +179,11 @@ func (s *State) PairCode(ttl time.Duration) (string, error) {
 func (s *State) PairChallenge(code, name, wake, manage string) (protocol.Challenge, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if len(code) != 32 || !s.db.CodeValid(protocol.Hash(code), s.now()) {
+		return protocol.Challenge{}, s.rejectPublic(fail(401, "unauthorized"))
+	}
 	if e := s.challengeLimit(""); e != nil {
 		return protocol.Challenge{}, e
-	}
-	if len(code) != 32 || !s.db.CodeValid(protocol.Hash(code), s.now()) {
-		return protocol.Challenge{}, fail(401, "unauthorized")
 	}
 	if strings.TrimSpace(name) == "" || utf8.RuneCountInString(name) > 64 {
 		return protocol.Challenge{}, fail(400, "invalid_request")
@@ -185,13 +201,14 @@ func (s *State) PairChallenge(code, name, wake, manage string) (protocol.Challen
 func (s *State) PairComplete(id, wakeSig, manageSig string) (protocol.Credentials, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	c, e := s.lookupChallenge(id, "pair", "")
+	if e != nil {
+		return protocol.Credentials{}, s.rejectPublic(e)
+	}
 	if !s.rate("global", 60) {
 		return protocol.Credentials{}, fail(429, "rate_limited")
 	}
-	c, e := s.consume(id, "pair", "")
-	if e != nil {
-		return protocol.Credentials{}, e
-	}
+	delete(s.challenges, id)
 	msg := protocol.PairMessage(id, c.Nonce, c.Wake, c.Manage)
 	if !protocol.Verify(c.Wake, wakeSig, msg) || !protocol.Verify(c.Manage, manageSig, msg) {
 		return protocol.Credentials{}, fail(403, "forbidden")
@@ -211,10 +228,10 @@ func (s *State) PairComplete(id, wakeSig, manageSig string) (protocol.Credential
 func (s *State) AuthChallenge(device string) (protocol.Challenge, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if e := s.challengeLimit(device); e != nil {
-		return protocol.Challenge{}, e
-	}
 	if _, e := s.validDevice(device); e != nil {
+		return protocol.Challenge{}, s.rejectPublic(e)
+	}
+	if e := s.challengeLimit(device); e != nil {
 		return protocol.Challenge{}, e
 	}
 	return s.newChallenge(challenge{Kind: "wake", Device: device}, time.Minute), nil
@@ -223,17 +240,18 @@ func (s *State) AuthComplete(device, id, sig string) (protocol.Credentials, erro
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.clean()
-	if !s.rate("global", 60) || !s.rate("device:"+device, 10) {
-		return protocol.Credentials{}, fail(429, "rate_limited")
-	}
-	c, e := s.consume(id, "wake", device)
+	c, e := s.lookupChallenge(id, "wake", device)
 	if e != nil {
-		return protocol.Credentials{}, e
+		return protocol.Credentials{}, s.rejectPublic(e)
 	}
 	d, e := s.validDevice(device)
 	if e != nil {
-		return protocol.Credentials{}, e
+		return protocol.Credentials{}, s.rejectPublic(e)
 	}
+	if !s.rate("device:"+device, 10) || !s.rate("global", 60) {
+		return protocol.Credentials{}, fail(429, "rate_limited")
+	}
+	delete(s.challenges, id)
 	if !protocol.Verify(d.WakeKey, sig, protocol.WakeMessage(device, id, c.Nonce)) {
 		return protocol.Credentials{}, fail(401, "unauthorized")
 	}
@@ -276,10 +294,10 @@ func (s *State) ManageChallenge(device, origin string, sessionMinutes int, allow
 	if sessionMinutes != 0 && sessionMinutes != 5 && sessionMinutes != 10 && sessionMinutes != 15 && sessionMinutes != 30 {
 		return protocol.Challenge{}, fail(400, "invalid_request")
 	}
-	if e := s.challengeLimit(device); e != nil {
+	if _, e := s.validDevice(device); e != nil {
 		return protocol.Challenge{}, e
 	}
-	if _, e := s.validDevice(device); e != nil {
+	if e := s.challengeLimit(device); e != nil {
 		return protocol.Challenge{}, e
 	}
 	return s.newChallenge(challenge{Kind: "manage", Device: device, Origin: origin, SessionMinutes: sessionMinutes, AllowAllDevices: allowAllDevices}, time.Minute), nil

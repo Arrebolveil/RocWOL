@@ -54,7 +54,7 @@ type Agent struct {
 	requests  sync.WaitGroup
 	closeOnce sync.Once
 	closeErr  error
-	statusMu  sync.Mutex
+	probeGate chan struct{}
 	status    Status
 }
 
@@ -74,7 +74,7 @@ func New(c Config, runner Runner) (*Agent, error) {
 		runner = commandRunner{}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	a := &Agent{config: c, ledger: l, runner: runner, tlsConfig: tlsConfig, ctx: ctx, cancel: cancel}
+	a := &Agent{config: c, ledger: l, runner: runner, tlsConfig: tlsConfig, ctx: ctx, cancel: cancel, probeGate: make(chan struct{}, 1)}
 	origin, _ := url.Parse(c.LuCIOrigin)
 	a.transport = &http.Transport{
 		Proxy:                 nil,
@@ -244,7 +244,12 @@ func (a *Agent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case strings.HasPrefix(r.URL.Path, apiPrefix+"wake/") && r.Method == http.MethodGet:
 			a.query(w, r, strings.TrimPrefix(r.URL.Path, apiPrefix+"wake/"))
 		case r.URL.Path == apiPrefix+"status" && r.Method == http.MethodGet:
-			writeJSON(w, 200, a.probe(fresh))
+			status, err := a.probe(r.Context(), fresh)
+			if err != nil {
+				writeError(w, 503, "upstream_unavailable", "Status probe canceled.", "")
+				return
+			}
+			writeJSON(w, 200, status)
 		default:
 			writeError(w, 404, "not_found", "Resource not found.", "")
 		}
@@ -374,15 +379,29 @@ func (a *Agent) query(w http.ResponseWriter, r *http.Request, id string) {
 	writeJSON(w, 200, result)
 }
 
-func (a *Agent) probe(fresh bool) Status {
-	a.statusMu.Lock()
-	defer a.statusMu.Unlock()
-	if !fresh && !a.status.CheckedAt.IsZero() && time.Since(a.status.CheckedAt) < 3*time.Second {
-		return a.status
+func (a *Agent) probe(caller context.Context, fresh bool) (Status, error) {
+	select {
+	case a.probeGate <- struct{}{}:
+		defer func() { <-a.probeGate }()
+	case <-caller.Done():
+		return Status{}, caller.Err()
 	}
-	ctx, cancel := context.WithTimeout(a.ctx, 2*time.Second)
+	// Cancellation may race with acquisition when the previous probe finishes.
+	if err := caller.Err(); err != nil {
+		return Status{}, err
+	}
+	if err := a.ctx.Err(); err != nil {
+		return Status{}, err
+	}
+	if !fresh && !a.status.CheckedAt.IsZero() && time.Since(a.status.CheckedAt) < 3*time.Second {
+		return a.status, nil
+	}
+	ctx, cancel := context.WithTimeout(caller, 2*time.Second)
 	defer cancel()
 	err := a.runner.Run(ctx, a.config.PingPath, "-c", "1", "-W", "1", "192.168.2.100")
+	if err := caller.Err(); err != nil {
+		return Status{}, err
+	}
 	state := "unknown"
 	if err == nil && ctx.Err() == nil {
 		state = "reachable"
@@ -393,7 +412,7 @@ func (a *Agent) probe(fresh bool) Status {
 		}
 	}
 	a.status = Status{TargetID: "desktop", Reachability: state, CheckedAt: time.Now().UTC()}
-	return a.status
+	return a.status, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
