@@ -1,0 +1,401 @@
+package gateway
+
+import (
+	"bufio"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"hubu.wiki/roc-wol/internal/protocol"
+	"hubu.wiki/roc-wol/internal/store"
+)
+
+const testOrigin = "https://wol.hubu.wiki"
+
+type testIdentity struct {
+	protocol.Credentials
+	manage *ecdsa.PrivateKey
+}
+
+func testSign(t *testing.T, k *ecdsa.PrivateKey, msg string) string {
+	t.Helper()
+	h := sha256.Sum256([]byte(msg))
+	b, e := ecdsa.SignASN1(rand.Reader, k, h[:])
+	if e != nil {
+		t.Fatal(e)
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+func identity(t *testing.T, g *Gateway) testIdentity {
+	t.Helper()
+	wk, e := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if e != nil {
+		t.Fatal(e)
+	}
+	mk, e := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if e != nil {
+		t.Fatal(e)
+	}
+	wb, _ := x509.MarshalPKIXPublicKey(&wk.PublicKey)
+	mb, _ := x509.MarshalPKIXPublicKey(&mk.PublicKey)
+	wp, mp := base64.RawURLEncoding.EncodeToString(wb), base64.RawURLEncoding.EncodeToString(mb)
+	code, e := g.Auth.PairCode(time.Minute)
+	if e != nil {
+		t.Fatal(e)
+	}
+	c, e := g.Auth.PairChallenge(code, "test phone", wp, mp)
+	if e != nil {
+		t.Fatal(e)
+	}
+	msg := protocol.PairMessage(c.ChallengeID, c.Nonce, wp, mp)
+	creds, e := g.Auth.PairComplete(c.ChallengeID, testSign(t, wk, msg), testSign(t, mk, msg))
+	if e != nil {
+		t.Fatal(e)
+	}
+	return testIdentity{creds, mk}
+}
+func session(t *testing.T, g *Gateway, id testIdentity) string {
+	t.Helper()
+	c, e := g.Auth.ManageChallenge(id.DeviceID, testOrigin, 10)
+	if e != nil {
+		t.Fatal(e)
+	}
+	tk, _, e := g.Auth.ManageTicket(id.DeviceID, c.ChallengeID, testSign(t, id.manage, protocol.ManageMessage(id.DeviceID, c.ChallengeID, c.Nonce, testOrigin)), testOrigin)
+	if e != nil {
+		t.Fatal(e)
+	}
+	cookie, _, e := g.Auth.Redeem(tk, testOrigin)
+	if e != nil {
+		t.Fatal(e)
+	}
+	return cookie
+}
+func fixture(t *testing.T, h http.HandlerFunc) *Gateway {
+	t.Helper()
+	up := httptest.NewServer(h)
+	t.Cleanup(up.Close)
+	db, e := store.Open(filepath.Join(t.TempDir(), "gateway.db"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	g := newGateway(Config{PublicOrigins: []string{testOrigin, "https://roc.hubu.wiki"}, AgentURL: up.URL}, db, http.DefaultTransport)
+	t.Cleanup(func() { g.Close() })
+	return g
+}
+func request(g *Gateway, method, path, token, cookie, payload string) *httptest.ResponseRecorder {
+	r := httptest.NewRequest(method, path, strings.NewReader(payload))
+	r.Host = "wol.hubu.wiki"
+	r.Header.Set("Origin", testOrigin)
+	if token != "" {
+		r.Header.Set("Authorization", "Bearer "+token)
+	}
+	if cookie != "" {
+		r.AddCookie(&http.Cookie{Name: "__Host-roc_session", Value: cookie})
+	}
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, r)
+	return w
+}
+func TestNoManagementOrAgentBypass(t *testing.T) {
+	var hits atomic.Int32
+	g := fixture(t, func(w http.ResponseWriter, r *http.Request) { hits.Add(1); w.WriteHeader(200) })
+	id := identity(t, g)
+	cookie := session(t, g, id)
+	for _, path := range []string{"/", "/cgi-bin/luci/", "/ubus", "/luci-static/resources/view/wol.js"} {
+		w := request(g, "GET", path, id.AccessToken, "", "")
+		if w.Code != 401 {
+			t.Fatalf("unauthorized %s status %d", path, w.Code)
+		}
+	}
+	w := request(g, "GET", "/_roc-agent/v1/status", "", cookie, "")
+	if w.Code != 404 {
+		t.Fatalf("private API reachable status %d", w.Code)
+	}
+	for _, path := range []string{"/%5froc-agent/v1/status", "/%2f_roc-agent/v1/status", "/foo/../_roc-agent/v1/status", "/foo%5cbar"} {
+		w = request(g, "GET", path, "", cookie, "")
+		if w.Code != 400 && w.Code != 404 {
+			t.Fatalf("path escaped reserved guard: %s %d", path, w.Code)
+		}
+	}
+	r := httptest.NewRequest("GET", "/", nil)
+	r.Host = "wol.hubu.wiki"
+	r.Header.Set("Cookie", "sysauth=pretend; __Host-roc_session=pretend")
+	r.Header.Set("X-Forwarded-User", "root")
+	r.Header.Set("Connection", "Upgrade")
+	r.Header.Set("Upgrade", "websocket")
+	r.Header.Set("Origin", testOrigin)
+	w = httptest.NewRecorder()
+	g.ServeHTTP(w, r)
+	if w.Code != 401 {
+		t.Fatalf("forged session accepted: %d", w.Code)
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("unauthorized traffic reached router %d times", hits.Load())
+	}
+}
+func TestOriginAndHostFailClosed(t *testing.T) {
+	var hits atomic.Int32
+	g := fixture(t, func(w http.ResponseWriter, r *http.Request) { hits.Add(1) })
+	id := identity(t, g)
+	cookie := session(t, g, id)
+	for _, origin := range []string{"", "https://evil.example", "https://roc.hubu.wiki"} {
+		r := httptest.NewRequest("POST", "/ubus", strings.NewReader("{}"))
+		r.Host = "wol.hubu.wiki"
+		r.Header.Set("Origin", origin)
+		r.AddCookie(&http.Cookie{Name: "__Host-roc_session", Value: cookie})
+		w := httptest.NewRecorder()
+		g.ServeHTTP(w, r)
+		if w.Code != 403 {
+			t.Fatalf("origin %q accepted: %d", origin, w.Code)
+		}
+	}
+	r := httptest.NewRequest("GET", "/", nil)
+	r.Host = "evil.example"
+	r.AddCookie(&http.Cookie{Name: "__Host-roc_session", Value: cookie})
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, r)
+	if w.Code != 421 || hits.Load() != 0 {
+		t.Fatal("host or origin bypassed gate")
+	}
+}
+func TestWakeDedupAndReconciliationNeverResends(t *testing.T) {
+	var sends, queries atomic.Int32
+	g := fixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			sends.Add(1)
+			protocol.JSON(w, 504, protocol.Wake{RequestID: strings.Repeat("a", 32), Result: "unknown", Code: "outcome_unknown"})
+			return
+		}
+		queries.Add(1)
+		now := time.Now().UTC()
+		protocol.JSON(w, 200, protocol.Wake{RequestID: strings.Repeat("a", 32), Result: "sent", SentAt: &now})
+	})
+	id := identity(t, g)
+	payload := `{"targetId":"desktop","requestId":"` + strings.Repeat("a", 32) + `"}`
+	w := request(g, "POST", "/_wol/v1/wake", id.AccessToken, "", payload)
+	if w.Code != 504 || !strings.Contains(w.Body.String(), `"result":"unknown"`) {
+		t.Fatalf("uncertain result not retained: %d %s", w.Code, w.Body.String())
+	}
+	w = request(g, "POST", "/_wol/v1/wake", id.AccessToken, "", payload)
+	if w.Code != 202 {
+		t.Fatalf("dedup failed to reconcile %d %s", w.Code, w.Body.String())
+	}
+	w = request(g, "GET", "/_wol/v1/wake/"+strings.Repeat("a", 32), id.AccessToken, "", "")
+	if w.Code != 200 {
+		t.Fatal(w.Code)
+	}
+	if sends.Load() != 1 || queries.Load() != 1 {
+		t.Fatalf("side effect repeated: sends=%d queries=%d", sends.Load(), queries.Load())
+	}
+	other := identity(t, g)
+	w = request(g, "GET", "/_wol/v1/wake/"+strings.Repeat("a", 32), other.AccessToken, "", "")
+	if w.Code != 404 {
+		t.Fatal("another device read wake")
+	}
+	w = request(g, "GET", "/_wol/v1/wake/"+strings.Repeat("b", 32), id.AccessToken, "", "")
+	if w.Code != 404 || sends.Load() != 1 {
+		t.Fatal("unknown query dispatched")
+	}
+}
+func TestPersistedPendingOnlyQueriesAfterRestart(t *testing.T) {
+	var sends atomic.Int32
+	g := fixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			sends.Add(1)
+		}
+		w.WriteHeader(404)
+	})
+	id := identity(t, g)
+	rid := strings.Repeat("b", 32)
+	if e := g.DB.CreateWake(store.WakeRecord{Wake: protocol.Wake{RequestID: rid, Result: "pending"}, DeviceID: id.DeviceID, CreatedAt: time.Now().UTC()}); e != nil {
+		t.Fatal(e)
+	}
+	restarted := newGateway(g.cfg, g.DB, http.DefaultTransport)
+	restarted.Auth = g.Auth
+	w := request(restarted, "POST", "/_wol/v1/wake", id.AccessToken, "", `{"targetId":"desktop","requestId":"`+rid+`"}`)
+	if w.Code != 504 || sends.Load() != 0 {
+		t.Fatalf("persisted pending replay sent a command: %d, %d", w.Code, sends.Load())
+	}
+}
+
+type gatedBody struct {
+	io.Reader
+	started, release chan struct{}
+	once             sync.Once
+}
+
+func (b *gatedBody) Read(p []byte) (int, error) {
+	b.once.Do(func() { close(b.started); <-b.release })
+	return b.Reader.Read(p)
+}
+
+func TestRevocationDuringWakeBodyPreventsDispatch(t *testing.T) {
+	var sends atomic.Int32
+	g := fixture(t, func(w http.ResponseWriter, r *http.Request) { sends.Add(1); w.WriteHeader(502) })
+	id := identity(t, g)
+	rid := strings.Repeat("c", 32)
+	body := &gatedBody{Reader: strings.NewReader(`{"targetId":"desktop","requestId":"` + rid + `"}`), started: make(chan struct{}), release: make(chan struct{})}
+	r := httptest.NewRequest("POST", "/_wol/v1/wake", body)
+	r.Host = "wol.hubu.wiki"
+	r.Header.Set("Origin", testOrigin)
+	r.Header.Set("Authorization", "Bearer "+id.AccessToken)
+	w := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() { defer close(done); g.ServeHTTP(w, r) }()
+	<-body.started
+	if err := g.Auth.Revoke(id.DeviceID); err != nil {
+		close(body.release)
+		<-done
+		t.Fatal(err)
+	}
+	close(body.release)
+	<-done
+	if w.Code != 401 || sends.Load() != 0 {
+		t.Fatalf("revoked request dispatched: status=%d upstream=%d", w.Code, sends.Load())
+	}
+	if _, err := g.DB.Wake(rid); err == nil {
+		t.Fatal("revoked request was admitted to the wake ledger")
+	}
+}
+
+func TestProxyRejectsBrowserNetworkPathRedirect(t *testing.T) {
+	g := fixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "///evil.example/")
+		w.WriteHeader(http.StatusFound)
+	})
+	id := identity(t, g)
+	w := request(g, "GET", "/cgi-bin/luci/", "", session(t, g, id), "")
+	if w.Code != 503 || w.Header().Get("Location") != "" {
+		t.Fatalf("external browser redirect escaped gateway: %d %q", w.Code, w.Header().Get("Location"))
+	}
+}
+func TestProxyCookieAndRedirectBoundary(t *testing.T) {
+	var leaked atomic.Bool
+	g := fixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.Header.Get("Cookie"), "roc_session") || r.Header.Get("Authorization") != "" {
+			leaked.Store(true)
+		}
+		w.Header().Add("Set-Cookie", "__Host-roc_session=override; Path=/")
+		w.Header().Add("Set-Cookie", "sysauth=ok; Domain=127.0.0.1; Path=/; HttpOnly")
+		if r.URL.Path == "/external" {
+			w.Header().Set("Location", "https://evil.example/")
+		} else {
+			w.Header().Set("Location", "http://127.0.0.1/cgi-bin/luci/")
+		}
+		w.WriteHeader(302)
+	})
+	id := identity(t, g)
+	cookie := session(t, g, id)
+	w := request(g, "GET", "/cgi-bin/luci/", id.AccessToken, cookie, "")
+	if w.Code != 302 || w.Header().Get("Location") != testOrigin+"/cgi-bin/luci/" {
+		t.Fatalf("internal redirect not translated: %d %s", w.Code, w.Header().Get("Location"))
+	}
+	cookies := w.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Name != "sysauth" || !cookies[0].Secure || cookies[0].Domain != "" || leaked.Load() {
+		t.Fatalf("proxy cookie isolation failed: %+v", cookies)
+	}
+	w = request(g, "GET", "/external", "", cookie, "")
+	if w.Code != 503 || w.Header().Get("Location") != "" {
+		t.Fatal("external redirect escaped proxy")
+	}
+}
+func TestWebSocketExpiresAndRevokesAfterHandshake(t *testing.T) {
+	for _, mode := range []string{"expires", "revokes"} {
+		t.Run(mode, func(t *testing.T) {
+			closed := make(chan struct{}, 1)
+			g := fixture(t, func(w http.ResponseWriter, r *http.Request) {
+				conn, rw, e := w.(http.Hijacker).Hijack()
+				if e != nil {
+					return
+				}
+				defer conn.Close()
+				_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+				_ = rw.Flush()
+				_, _ = io.Copy(io.Discard, conn)
+				closed <- struct{}{}
+			})
+			id := identity(t, g)
+			if mode == "expires" {
+				g.Auth.MaxSessionTTL = 500 * time.Millisecond
+			}
+			cookie := session(t, g, id)
+			server := httptest.NewServer(g)
+			defer server.Close()
+			conn, e := net.Dial("tcp", strings.TrimPrefix(server.URL, "http://"))
+			if e != nil {
+				t.Fatal(e)
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(4 * time.Second))
+			_, _ = fmt.Fprintf(conn, "GET /socket HTTP/1.1\r\nHost: wol.hubu.wiki\r\nOrigin: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nCookie: __Host-roc_session=%s\r\n\r\n", testOrigin, cookie)
+			resp, e := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "GET"})
+			if e != nil {
+				t.Fatal(e)
+			}
+			if resp.StatusCode != 101 {
+				t.Fatalf("upgrade status %d", resp.StatusCode)
+			}
+			if mode == "revokes" {
+				if e = g.Auth.Revoke(id.DeviceID); e != nil {
+					t.Fatal(e)
+				}
+			}
+			select {
+			case <-closed:
+			case <-time.After(3 * time.Second):
+				t.Fatal("upgraded upstream survived expiry/revocation")
+			}
+			buf := make([]byte, 1)
+			_, e = conn.Read(buf)
+			if e == nil {
+				t.Fatal("upgraded client still open")
+			}
+		})
+	}
+}
+func TestStrictJSONAndPublicRedemption(t *testing.T) {
+	g := fixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("unexpected upstream request") })
+	for _, payload := range []string{`{"deviceId":"a","deviceId":"b"}`, `{} {}`, `{"extra":true}`, string([]byte{'{', '"', 'x', '"', ':', '"', 0xff, '"', '}'})} {
+		w := request(g, "POST", "/_wol/v1/auth/challenge", "", "", payload)
+		if w.Code != 400 {
+			t.Fatalf("malformed JSON accepted: %d", w.Code)
+		}
+	}
+	id := identity(t, g)
+	c, e := g.Auth.ManageChallenge(id.DeviceID, testOrigin, 10)
+	if e != nil {
+		t.Fatal(e)
+	}
+	tk, _, e := g.Auth.ManageTicket(id.DeviceID, c.ChallengeID, testSign(t, id.manage, protocol.ManageMessage(id.DeviceID, c.ChallengeID, c.Nonce, testOrigin)), testOrigin)
+	if e != nil {
+		t.Fatal(e)
+	}
+	payload, _ := json.Marshal(map[string]string{"ticket": tk})
+	w := request(g, "POST", "/_wol/v1/manage/redeem", "", "", string(payload))
+	if w.Code != 200 {
+		t.Fatal(w.Code)
+	}
+	cs := w.Result().Cookies()
+	if len(cs) != 1 || cs[0].Name != "__Host-roc_session" || !cs[0].HttpOnly || !cs[0].Secure || cs[0].SameSite != http.SameSiteStrictMode || cs[0].Path != "/" || cs[0].Domain != "" {
+		t.Fatalf("unsafe management cookie: %+v", cs)
+	}
+	w = request(g, "POST", "/_wol/v1/manage/redeem", "", "", string(payload))
+	if w.Code != 409 {
+		t.Fatal("ticket replay accepted")
+	}
+}

@@ -1,0 +1,32 @@
+[Unit]
+Description=Roc WOL private STCP visitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=roc-wol
+Group=roc-wol
+ExecStartPre=/opt/roc-wol/bin/frpc verify -c /opt/roc-wol/frpc.toml
+ExecStart=/opt/roc-wol/bin/frpc -c /opt/roc-wol/frpc.toml
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

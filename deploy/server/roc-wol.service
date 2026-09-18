@@ -1,0 +1,36 @@
+[Unit]
+Description=Roc WOL authenticated gateway
+After=network-online.target roc-wol-visitor.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=roc-wol
+Group=roc-wol
+ExecStart=/opt/roc-wol/bin/roc-wol serve --config /etc/roc-wol/gateway.json
+Restart=on-failure
+RestartSec=3
+UMask=0077
+RuntimeDirectory=roc-wol
+RuntimeDirectoryMode=0700
+StateDirectory=roc-wol
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/roc-wol /run/roc-wol
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
