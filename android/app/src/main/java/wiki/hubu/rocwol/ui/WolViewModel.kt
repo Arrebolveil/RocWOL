@@ -10,9 +10,12 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import wiki.hubu.rocwol.data.ApiException
@@ -59,6 +62,8 @@ class WolViewModel(application: Application) : AndroidViewModel(application) {
         allowAllDevices = repository.allowAllDevices, management = repository.management
     ).let { it.copy(resultText = it.wake?.let(::resultLabel) ?: "尚无唤醒请求") })
     val state = mutable.asStateFlow()
+    private val noticeChannel = Channel<String>(Channel.CONFLATED)
+    val notices: Flow<String> = noticeChannel.receiveAsFlow()
     private var foreground = false
     private var poll: Job? = null
     private var operation: Job? = null
@@ -87,7 +92,8 @@ class WolViewModel(application: Application) : AndroidViewModel(application) {
     }
     fun pair(activity: Activity, code: String, name: String) = runOperation {
         repository.pair(activity, code.trim().uppercase(), name.trim())
-        mutable.update { it.copy(paired = true, deviceName = name.trim(), message = "配对成功", server = "可达") }
+        mutable.update { it.copy(paired = true, deviceName = name.trim(), server = "可达") }
+        noticeChannel.trySend("配对成功")
         loadTarget()
         loadManagement()
     }
@@ -107,7 +113,8 @@ class WolViewModel(application: Application) : AndroidViewModel(application) {
         runOperation {
             if (state.value.paired) repository.endManagement()
             repository.selectOrigin(origin)
-            mutable.update { it.copy(origin = origin, target = null, server = "尚未检测", waiting = false, waitUntil = null, message = "线路已手动切换，不会自动重发唤醒请求。") }
+            mutable.update { it.copy(origin = origin, target = null, server = "尚未检测", waiting = false, waitUntil = null) }
+            noticeChannel.trySend("线路已切换，未重发唤醒请求")
             if (state.value.paired) {
                 loadManagement()
                 loadTarget()
@@ -174,7 +181,7 @@ class WolViewModel(application: Application) : AndroidViewModel(application) {
         val openBrowser = state.value.autoOpenBrowser
         val granted = repository.authorizeManagement(activity)
         publishManagement()
-        mutable.update { it.copy(message = "已授权管理 ${granted.sessionMinutes} 分钟；返回 App 不会取消授权。") }
+        noticeChannel.trySend("已授权管理 ${granted.sessionMinutes} 分钟")
         if (openBrowser) launchManagementBrowser(activity)
     }
     fun openManagement(activity: Activity) = runOperation {
@@ -194,7 +201,7 @@ class WolViewModel(application: Application) : AndroidViewModel(application) {
     fun endManagement() = runOperation {
         repository.endManagement()
         publishManagement()
-        mutable.update { it.copy(message = "已取消授权，浏览器再次访问需重新授权；唤醒功能不受影响。") }
+        noticeChannel.trySend("管理授权已取消，唤醒功能不受影响")
     }
     private suspend fun loadManagement() {
         managementRefreshRequested = false
@@ -310,8 +317,11 @@ class WolViewModel(application: Application) : AndroidViewModel(application) {
                     if (uncertainManagement) "尚未确认管理授权已取消，请在服务器撤销旧设备；原授权到期后会自动失效。" else "") }
             return
         }
+        if (error is AuthenticationCancelled) {
+            noticeChannel.trySend("已取消系统认证，已有授权不受影响")
+            return
+        }
         val message = when (error) {
-            is AuthenticationCancelled -> "已取消系统认证，没有提交新的管理授权；已有授权不受影响。"
             is AuthenticationUnavailable -> "此设备无法完成逐次 CryptoObject 管理签名。需要 Android 11 及以上、安全锁屏与可用的强生物识别或锁屏凭据；不会降级管理密钥。"
             is ApiException -> when (error.code) {
                 "unauthorized" -> "认证已失效，请再次操作以重新认证。配对时请检查配对码。"
@@ -332,11 +342,11 @@ class WolViewModel(application: Application) : AndroidViewModel(application) {
             else -> "操作未完成，请刷新状态后重试。若配对提交时断网，请在服务器检查设备记录后重新签发配对码。"
         }
         mutable.update {
-            it.copy(message = (if (repository.managementPending && !repository.managementKnown)
+            it.copy(message = if (polling && it.message != null) it.message else (if (repository.managementPending && !repository.managementKnown)
                 "管理授权状态尚未确认，请刷新状态或点击“取消授权”向服务器关闭；不会因网络错误或返回 App 自动取消。\n"
                 else if (repository.management != null)
                     "本次操作不会自动取消已确认的管理授权；可手动取消或刷新状态。\n"
-                else "") + (if (polling && it.message != null) it.message else message),
+                else "") + message,
                 server = if (error is NetworkException) "不可达" else if (error is ApiException) "可达" else it.server,
                 target = if (error is NetworkException || (error is ApiException && error.status >= 500)) null else it.target)
         }

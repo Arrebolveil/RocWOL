@@ -25,8 +25,8 @@ require(fallbackOrigin == "https://roc.hubu.wiki")
         applicationId = "wiki.hubu.rocwol"
         minSdk = 30
         targetSdk = 36
-        versionCode = 4
-        versionName = "1.2.0"
+        versionCode = 5
+        versionName = "1.2.1"
         buildConfigField("String", "DIRECT_ORIGIN", "\"$directOrigin\"")
         buildConfigField("String", "FALLBACK_ORIGIN", "\"$fallbackOrigin\"")
     }
