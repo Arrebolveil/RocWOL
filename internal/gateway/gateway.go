@@ -270,6 +270,7 @@ func (g *Gateway) api(w http.ResponseWriter, r *http.Request, origin string) {
 		return
 	}
 	known := p == "/_wol/v1/target" && r.Method == "GET" || p == "/_wol/v1/wake" && r.Method == "POST" || strings.HasPrefix(p, "/_wol/v1/wake/") && r.Method == "GET" || p == "/_wol/v1/manage/challenge" && r.Method == "POST" || p == "/_wol/v1/manage/authorize" && r.Method == "POST" || p == "/_wol/v1/manage/browser" && r.Method == "POST" || p == "/_wol/v1/manage/status" && r.Method == "GET" || p == "/_wol/v1/manage/end" && r.Method == "POST"
+	known = known || deviceAdministrationRoute(p, r.Method)
 	if !known {
 		protocol.Fail(w, 404, "not_found")
 		return
@@ -286,6 +287,10 @@ func (g *Gateway) api(w http.ResponseWriter, r *http.Request, origin string) {
 	}
 	defer release()
 	r = r.WithContext(ctx)
+	if deviceAdministrationRoute(p, r.Method) {
+		g.deviceAdministration(w, r, device, origin)
+		return
+	}
 	switch {
 	case p == "/_wol/v1/manage/end" && r.Method == "POST":
 		if !body(w, r, &struct{}{}) {

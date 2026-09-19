@@ -1,14 +1,22 @@
 package wiki.hubu.rocwol.data
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import wiki.hubu.rocwol.BuildConfig
 import java.io.IOException
 import java.net.URI
+import java.net.ConnectException
+import java.net.NoRouteToHostException
+import java.net.SocketException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import java.net.URL
 import java.time.Instant
 import javax.net.ssl.HttpsURLConnection
+import javax.net.ssl.SSLException
 
 object Origins {
     val all = listOf(BuildConfig.DIRECT_ORIGIN, BuildConfig.FALLBACK_ORIGIN)
@@ -23,7 +31,18 @@ object Origins {
 }
 
 class ApiException(val status: Int, val code: String, val retryAfter: Long? = null) : IOException(code)
-class NetworkException : IOException("Network request failed")
+enum class NetworkFailureKind { DNS, TLS, TIMEOUT, CONNECTION, OTHER }
+
+class NetworkException(val kind: NetworkFailureKind = NetworkFailureKind.OTHER) : IOException("Network request failed")
+
+fun networkFailureKind(error: IOException): NetworkFailureKind = when (error) {
+    is NetworkException -> error.kind
+    is UnknownHostException -> NetworkFailureKind.DNS
+    is SSLException -> NetworkFailureKind.TLS
+    is SocketTimeoutException -> NetworkFailureKind.TIMEOUT
+    is ConnectException, is NoRouteToHostException, is SocketException -> NetworkFailureKind.CONNECTION
+    else -> NetworkFailureKind.OTHER
+}
 data class ApiReply(val status: Int, val body: JSONObject)
 
 class Api {
@@ -49,6 +68,7 @@ class Api {
                 connection.outputStream.use { it.write(bytes) }
             }
             val status = connection.responseCode
+            currentCoroutineContext().ensureActive()
             if (status in 300..399) throw ApiException(status, "redirect_refused")
             val type = connection.contentType?.substringBefore(';')?.trim()?.lowercase()
             if (type != "application/json") throw ApiException(status, "non_json_response")
@@ -57,6 +77,7 @@ class Api {
                 val output = java.io.ByteArrayOutputStream()
                 val buffer = ByteArray(4096)
                 while (output.size() <= 65_536) {
+                    currentCoroutineContext().ensureActive()
                     val count = input.read(buffer, 0, minOf(buffer.size, 65_537 - output.size()))
                     if (count < 0) break
                     output.write(buffer, 0, count)
@@ -71,8 +92,9 @@ class Api {
             ApiReply(status, json)
         } catch (e: ApiException) {
             throw e
-        } catch (_: IOException) {
-            throw NetworkException()
+        } catch (error: IOException) {
+            currentCoroutineContext().ensureActive()
+            throw NetworkException(networkFailureKind(error))
         } finally {
             connection.disconnect()
         }

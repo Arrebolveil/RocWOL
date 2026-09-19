@@ -69,7 +69,7 @@ class DeviceKeys {
         signature.update(message.toByteArray(Charsets.UTF_8))
         encode(signature.sign())
     }
-    suspend fun signManagement(activity: Activity, message: String, sessionMinutes: Int?, allowAllDevices: Boolean): String {
+    suspend fun signManagement(activity: Activity, message: String, sessionMinutes: Int?, allowAllDevices: Boolean, purpose: String? = null): String {
         val signature = withContext(Dispatchers.IO) {
             try { signer(MANAGE) }
             catch (e: java.security.GeneralSecurityException) { throw AuthenticationUnavailable(e) }
@@ -80,8 +80,9 @@ class DeviceKeys {
                 continuation.invokeOnCancellation { cancellation.cancel() }
                 try {
                     val prompt = BiometricPrompt.Builder(activity)
-                        .setTitle(if (sessionMinutes == null) "授权此手机" else "授权路由器管理")
+                        .setTitle(if (purpose != null) "验证设备管理" else if (sessionMinutes == null) "授权此手机" else "授权路由器管理")
                         .setSubtitle(when {
+                            purpose != null -> purpose
                             sessionMinutes == null -> "验证管理密钥后才能完成双密钥配对"
                             sessionMinutes == 0 && allowAllDevices -> "永久授权：允许所有设备访问当前线路"
                             sessionMinutes == 0 -> "永久授权：仅限本机打开的浏览器"
@@ -89,6 +90,7 @@ class DeviceKeys {
                             else -> "仅授权本机打开的浏览器，授权 $sessionMinutes 分钟"
                         })
                         .setDescription(when {
+                            purpose != null -> "仅批准本次设备管理操作，不会开启或延长路由器管理授权。每次查看或撤销设备都需要重新验证。"
                             sessionMinutes == null -> "此认证用于注册管理密钥，不会开启路由器管理授权。"
                             sessionMinutes == 0 -> (if (allowAllDevices) "任何设备均可通过当前线路访问 LuCI 登录页，仍需 LuCI 登录。" else "仅本机浏览器可访问，仍需 LuCI 登录。") +
                                 "授权无自动到期时间，返回 App 不会取消。请在 App 手动取消；撤销设备或网关重启也会使授权失效。"

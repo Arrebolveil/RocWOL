@@ -7,6 +7,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import wiki.hubu.rocwol.data.journal.OperationJournal
 import wiki.hubu.rocwol.security.DeviceKeys
 import wiki.hubu.rocwol.security.IdentityLost
 import java.security.SecureRandom
@@ -18,6 +19,7 @@ class Repository(context: Context) {
         val sessionMinutesOptions = listOf(5, 10, 15, 30, 0)
     }
     private val preferences = context.getSharedPreferences("roc_wol_identity", Context.MODE_PRIVATE)
+    internal val journal = OperationJournal.get(context)
     val keys = DeviceKeys()
     private val api = Api()
     private val authLock = Mutex()
@@ -184,7 +186,7 @@ class Repository(context: Context) {
         }
         token ?: throw IdentityLost()
     }
-    private suspend fun authenticated(path: String, body: JSONObject? = null, requestOrigin: String = origin): ApiReply {
+    internal suspend fun authenticated(path: String, body: JSONObject? = null, requestOrigin: String = origin): ApiReply {
         val access = accessToken()
         return try { api.request(requestOrigin, path, body, access) } catch (e: ApiException) {
             if (e.status == 401) clearToken()

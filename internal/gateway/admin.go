@@ -69,7 +69,7 @@ func (g *Gateway) admin(w http.ResponseWriter, r *http.Request) {
 		}
 		out := make([]map[string]any, 0, len(devices))
 		for _, d := range devices {
-			out = append(out, map[string]any{"deviceId": d.DeviceID, "deviceName": d.DeviceName, "createdAt": d.CreatedAt, "revoked": d.Revoked})
+			out = append(out, map[string]any{"deviceId": d.DeviceID, "deviceName": d.DeviceName, "createdAt": d.CreatedAt, "revoked": d.Revoked, "deviceAdministration": d.DeviceAdministration})
 		}
 		protocol.JSON(w, 200, out)
 	case r.Method == "POST" && r.URL.Path == "/devices/revoke":
@@ -92,6 +92,27 @@ func (g *Gateway) admin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		protocol.JSON(w, 200, map[string]bool{"revoked": true})
+	case r.Method == "POST" && r.URL.Path == "/devices/admin":
+		var v struct {
+			DeviceID string `json:"deviceId"`
+			Enabled  *bool  `json:"enabled"`
+		}
+		if !body(w, r, &v) {
+			return
+		}
+		if !protocol.ValidID(v.DeviceID) || v.Enabled == nil {
+			protocol.Fail(w, 400, "invalid_request")
+			return
+		}
+		if e := g.Auth.SetDeviceAdministration(v.DeviceID, *v.Enabled); e != nil {
+			if errors.Is(e, store.ErrUnavailable) {
+				protocol.Fail(w, 404, "not_found")
+			} else {
+				respondError(w, e)
+			}
+			return
+		}
+		protocol.JSON(w, 200, protocol.DeviceAdministrationAccess{DeviceID: v.DeviceID, DeviceAdministration: *v.Enabled})
 	default:
 		protocol.Fail(w, 404, "not_found")
 	}

@@ -68,6 +68,29 @@ type ManagementBrowser struct {
 	AuthorizationExpiresAt time.Time `json:"authorizationExpiresAt"`
 }
 
+type DeviceAdministrationAccess struct {
+	DeviceID             string `json:"deviceId"`
+	DeviceAdministration bool   `json:"deviceAdministration"`
+}
+
+type AdministeredDevice struct {
+	DeviceID             string    `json:"deviceId"`
+	DeviceName           string    `json:"deviceName"`
+	CreatedAt            time.Time `json:"createdAt"`
+	Current              bool      `json:"current"`
+	DeviceAdministration bool      `json:"deviceAdministration"`
+}
+
+type DeviceList struct {
+	Devices []AdministeredDevice `json:"devices"`
+}
+
+type DeviceRevocation struct {
+	DeviceID string `json:"deviceId"`
+	Revoked  bool   `json:"revoked"`
+	Current  bool   `json:"current"`
+}
+
 func Random(n int) string {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
@@ -142,6 +165,10 @@ func ManageMessage(device, id, nonce, origin string, sessionMinutes int, allowAl
 		scope = "all-devices"
 	}
 	return strings.Join([]string{"ROCWOL-MANAGE-V2", ServiceID, device, id, nonce, origin, strconv.Itoa(sessionMinutes), scope}, "\n")
+}
+
+func DeviceAdministrationMessage(device, id, nonce, origin, action, target string) string {
+	return strings.Join([]string{"ROCWOL-DEVICE-ADMIN-V1", ServiceID, device, id, nonce, origin, action, target}, "\n")
 }
 
 // DecodeJSON rejects duplicate keys as well as unknown fields, malformed UTF-8,

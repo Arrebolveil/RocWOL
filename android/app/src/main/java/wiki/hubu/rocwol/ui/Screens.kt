@@ -49,11 +49,9 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Warning
-import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilledTonalButton
@@ -66,9 +64,8 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.NavigationBar
-import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
@@ -106,6 +103,9 @@ import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.semantics.disabled
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.LayoutDirection
@@ -126,7 +126,7 @@ import java.time.format.DateTimeFormatter
 
 @OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
-fun RocApp(activity: Activity, model: WolViewModel) {
+fun RocApp(activity: Activity, model: WolViewModel, managementRequest: Int = 0) {
     val state by model.state.collectAsStateWithLifecycle()
     val themeSettings = rememberThemeSettings()
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -140,15 +140,21 @@ fun RocApp(activity: Activity, model: WolViewModel) {
         detailsVisible = false
     }
     var showProgress by remember { mutableStateOf(false) }
-    // Intentionally not saved: every activity launch opens Wake, never management.
-    var tab by remember { mutableIntStateOf(0) }
+    // A reminder may open Management, but never starts an authorization.
+    var tab by remember { mutableIntStateOf(if (activity.intent?.getBooleanExtra("open_management", false) == true) 1 else 0) }
     val wakeScroll = rememberScrollState()
     val managementScroll = rememberScrollState()
     val settingsScroll = rememberScrollState()
     val travel = with(LocalDensity.current) { 32.dp.roundToPx() }
     val layoutDirection = if (LocalLayoutDirection.current == LayoutDirection.Rtl) -1 else 1
+    LaunchedEffect(managementRequest) {
+        if (managementRequest > 0) {
+            focusManager.clearFocus()
+            tab = 1
+        }
+    }
     LaunchedEffect(tab, state.paired) {
-        if (tab == 1 && state.paired) model.refreshManagement()
+        if (tab == 1 && state.paired) model.refreshManagement(userInitiated = false)
     }
     LaunchedEffect(state.busy) {
         if (state.busy) delay(150)
@@ -200,10 +206,9 @@ fun RocApp(activity: Activity, model: WolViewModel) {
                     enter = fadeIn(tween(180)) + expandVertically(tween(220, easing = FastOutSlowInEasing)),
                     exit = fadeOut(tween(100)) + shrinkVertically(tween(180, easing = FastOutSlowInEasing))
                 ) {
-                    NavigationBar {
-                        NavigationBarItem(selected = tab == 0, onClick = { focusManager.clearFocus(); tab = 0 }, icon = { Icon(Icons.Default.Home, contentDescription = null) }, label = { Text("唤醒") })
-                        NavigationBarItem(selected = tab == 1, onClick = { focusManager.clearFocus(); tab = 1 }, icon = { Icon(Icons.Default.Lock, contentDescription = null) }, label = { Text("管理") })
-                        NavigationBarItem(selected = tab == 2, onClick = { focusManager.clearFocus(); tab = 2 }, icon = { Icon(Icons.Default.Settings, contentDescription = null) }, label = { Text("设置") })
+                    SlidingNavigationBar(tab) { selected ->
+                        focusManager.clearFocus()
+                        tab = selected
                     }
                 }
             }
@@ -246,7 +251,7 @@ fun RocApp(activity: Activity, model: WolViewModel) {
                                 }
                             }
                             1 -> ManagementPage(activity, model, pageState, current)
-                            else -> SettingsPage(model, pageState, themeSettings.mode) { if (current) themeSettings.select(it) }
+                            else -> SettingsPage(activity, model, pageState, themeSettings.mode) { if (current) themeSettings.select(it) }
                         }
                         Spacer(Modifier.height(8.dp))
                     }
@@ -390,12 +395,13 @@ private fun WakePage(model: WolViewModel, state: ScreenState) {
             AnimatedVisibility(state.target?.checkedAt != null, enter = fadeIn(tween(180)) + expandVertically(tween(220)), exit = fadeOut(tween(100)) + shrinkVertically(tween(180))) {
                 state.target?.checkedAt?.let { Text("检测时间：${formatTime(it)}", style = MaterialTheme.typography.bodySmall) }
             }
-            OutlinedButton(onClick = model::refresh, enabled = !state.busy, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("刷新状态") }
+            OutlinedButton(onClick = { model.refresh() }, enabled = !state.busy, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("刷新状态") }
         }
     }
     val retryOriginal = state.wake?.let { !it.gatewayConfirmed && it.result in setOf("pending", "unknown") && it.createdAt.isAfter(java.time.Instant.now().minusSeconds(86_400)) } == true
     PrimaryAction(if (retryOriginal) "重试原唤醒请求（相同 ID）" else "唤醒电脑", onClick = model::requestWake, enabled = !state.busy, minHeight = 60.dp)
     LastResult(model, state)
+    WakeHistoryAction(model)
     Text("仅支持远程唤醒，不提供关机功能。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
 }
 
@@ -437,7 +443,7 @@ private fun LastResult(model: WolViewModel, state: ScreenState) {
 }
 
 @Composable
-private fun SettingsPage(model: WolViewModel, state: ScreenState, themeMode: ThemeMode, onThemeChange: (ThemeMode) -> Unit) {
+private fun SettingsPage(activity: Activity, model: WolViewModel, state: ScreenState, themeMode: ThemeMode, onThemeChange: (ThemeMode) -> Unit) {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("外观", style = MaterialTheme.typography.titleMedium)
@@ -483,6 +489,7 @@ private fun SettingsPage(model: WolViewModel, state: ScreenState, themeMode: The
             Text("目标由部署端维护，App 内只读。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
+    SettingsUtilities(activity, model, state)
     if (state.paired) {
         Text("此手机 · ${state.deviceName}", style = MaterialTheme.typography.titleMedium)
         TextButton(onClick = model::requestForget, enabled = !state.busy, modifier = Modifier.heightIn(min = 48.dp)) { Text("清除本机身份并重新配对") }
@@ -497,6 +504,11 @@ private fun ManagementPage(activity: Activity, model: WolViewModel, state: Scree
     var confirmPermanent by remember { mutableStateOf(false) }
     val authorization = state.management
     val lifecycleOwner = LocalLifecycleOwner.current
+    var showRefreshProgress by remember { mutableStateOf(false) }
+    LaunchedEffect(state.managementRefreshing) {
+        if (state.managementRefreshing) delay(150)
+        showRefreshProgress = state.managementRefreshing
+    }
     LaunchedEffect(authorization?.expiresAt, lifecycleOwner, current) {
         if (!current) return@LaunchedEffect
         lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
@@ -506,7 +518,7 @@ private fun ManagementPage(activity: Activity, model: WolViewModel, state: Scree
                 delay(1_000)
                 now = Instant.now()
             }
-            model.refreshManagement()
+            model.refreshManagement(userInitiated = false)
         }
     }
     val active = authorization?.let { it.isPermanent || it.expiresAt.isAfter(now) } == true
@@ -522,7 +534,16 @@ private fun ManagementPage(activity: Activity, model: WolViewModel, state: Scree
                     }
                     Text("管理授权", style = MaterialTheme.typography.titleMedium)
                 }
-                TextButton(onClick = model::refreshManagement, enabled = state.paired && !state.busy) { Text("刷新") }
+                TextButton(onClick = { model.refreshManagement() }, enabled = state.paired && !state.busy,
+                    modifier = Modifier.semantics {
+                        if (state.managementRefreshing) { stateDescription = "正在刷新"; disabled() }
+                    }) {
+                    Box(Modifier.size(16.dp), contentAlignment = Alignment.Center) {
+                        if (showRefreshProgress) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                    }
+                    Spacer(Modifier.size(8.dp))
+                    Text("刷新")
+                }
             }
             MotionText(
                 when { !state.paired -> "尚未配对"; uncertain -> "授权状态待确认"; active -> "已授权"; !state.managementKnown -> "尚未确认"; authorization != null -> "授权已到期"; else -> "未授权" },

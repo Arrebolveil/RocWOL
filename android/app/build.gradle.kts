@@ -4,6 +4,7 @@ plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+    id("com.google.devtools.ksp")
 }
 
 val signingRoot = File(System.getenv("LOCALAPPDATA") ?: System.getProperty("user.home"), "RocWol/signing")
@@ -25,8 +26,8 @@ require(fallbackOrigin == "https://roc.hubu.wiki")
         applicationId = "wiki.hubu.rocwol"
         minSdk = 30
         targetSdk = 36
-        versionCode = 6
-        versionName = "1.3.0"
+        versionCode = 7
+        versionName = "1.4.0"
         buildConfigField("String", "DIRECT_ORIGIN", "\"$directOrigin\"")
         buildConfigField("String", "FALLBACK_ORIGIN", "\"$fallbackOrigin\"")
     }
@@ -75,4 +76,13 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.9.4")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.9.4")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
+    implementation("androidx.room:room-runtime:2.8.4")
+    implementation("androidx.room:room-ktx:2.8.4")
+    ksp("androidx.room:room-compiler:2.8.4")
+    implementation("androidx.work:work-runtime-ktx:2.10.1")
+    testImplementation("junit:junit:4.13.2")
+}
+
+ksp {
+    arg("room.schemaLocation", "$projectDir/schemas")
 }

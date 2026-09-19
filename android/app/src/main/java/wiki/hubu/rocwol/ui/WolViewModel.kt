@@ -6,6 +6,7 @@ import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.net.Uri
 import android.security.keystore.KeyPermanentlyInvalidatedException
+import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
@@ -29,6 +30,19 @@ import wiki.hubu.rocwol.data.NetworkException
 import wiki.hubu.rocwol.data.Repository
 import wiki.hubu.rocwol.data.Target
 import wiki.hubu.rocwol.data.WakeRecord
+import wiki.hubu.rocwol.data.NetworkFailureKind
+import wiki.hubu.rocwol.data.DiagnosticReport
+import wiki.hubu.rocwol.data.DiagnosticOutcome
+import wiki.hubu.rocwol.data.journal.JournalAction
+import wiki.hubu.rocwol.data.journal.JournalOutcome
+import wiki.hubu.rocwol.data.journal.JournalTrigger
+import wiki.hubu.rocwol.data.journal.JournalError
+import wiki.hubu.rocwol.data.journal.JournalEvent
+import wiki.hubu.rocwol.data.journal.JournalReachability
+import wiki.hubu.rocwol.data.journal.JournalRouter
+import wiki.hubu.rocwol.data.journal.JournalTarget
+import wiki.hubu.rocwol.data.journal.WakeStage
+import wiki.hubu.rocwol.reminders.AuthorizationReminders
 import wiki.hubu.rocwol.security.AuthenticationCancelled
 import wiki.hubu.rocwol.security.AuthenticationUnavailable
 import wiki.hubu.rocwol.security.IdentityLost
@@ -40,6 +54,7 @@ import java.time.Instant
     val deviceName: String = "我的手机",
     val origin: String = "",
     val busy: Boolean = false,
+    val managementRefreshing: Boolean = false,
     val server: String = "尚未检测",
     val target: Target? = null,
     val wake: WakeRecord? = null,
@@ -60,7 +75,9 @@ import java.time.Instant
 )
 
 class WolViewModel(application: Application) : AndroidViewModel(application) {
-    private val repository = Repository(application)
+    internal val repository = Repository(application)
+    val journal = repository.journal
+    val reminders = AuthorizationReminders.get(application)
     private val mutable = MutableStateFlow(ScreenState(
         paired = repository.deviceId != null, deviceName = repository.displayName,
         origin = repository.origin, wake = repository.rememberedWake(), managementPending = repository.managementPending,
@@ -75,6 +92,7 @@ class WolViewModel(application: Application) : AndroidViewModel(application) {
     private var poll: Job? = null
     private var operation: Job? = null
     private var managementExpiry: Job? = null
+    private var managementRefresh: Job? = null
     private var managementRefreshRequested = false
     private val mutationLock = Mutex()
 
@@ -82,46 +100,62 @@ class WolViewModel(application: Application) : AndroidViewModel(application) {
         foreground = value
         if (!value) {
             poll?.cancel(); poll = null
+            managementRefresh?.cancel(); managementRefresh = null
             return
         }
         if (!state.value.paired) return
         managementRefreshRequested = true
-        if (!state.value.busy) refresh()
+        if (!state.value.busy) refresh(userInitiated = false)
     }
     fun dismissMessage() { mutable.update { it.copy(message = null) } }
     fun dismissConfirmation() { mutable.update { it.copy(confirmNewWake = false, confirmForget = false) } }
     fun requestForget() { mutable.update { it.copy(confirmForget = true) } }
     fun forget() = runOperation {
-        repository.endManagement()
-        repository.forgetIdentity()
+        recorded(JournalAction.AUTHORIZATION_END) { repository.endManagement() }
+        clearReminders()
+        recorded(JournalAction.IDENTITY_FORGET) { repository.forgetIdentity() }
         mutable.update { ScreenState(origin = repository.origin, sessionMinutes = repository.sessionMinutes,
             autoOpenBrowser = repository.autoOpenBrowser, allowAllDevices = repository.allowAllDevices,
             warnAllDevices = repository.warnAllDevices,
             message = "本机身份已清除；服务器上的旧设备仍需通过 CLI 撤销。") }
     }
     fun pair(activity: Activity, code: String, name: String) = runOperation {
-        repository.pair(activity, code.trim().uppercase(), name.trim())
+        recorded(JournalAction.PAIR) { repository.pair(activity, code.trim().uppercase(), name.trim()) }
         mutable.update { it.copy(paired = true, deviceName = name.trim(), server = "可达") }
         noticeChannel.trySend("配对成功")
         loadTarget()
         loadManagement()
     }
-    fun refresh() = runOperation {
+    fun refresh(userInitiated: Boolean = true) = runOperation {
         try { loadManagement() }
         catch (e: CancellationException) { throw e }
         catch (e: Exception) { handleError(e) }
-        if (state.value.paired) loadTarget(fresh = true)
+        if (state.value.paired) loadTarget(fresh = true, trigger = if (userInitiated) JournalTrigger.USER else JournalTrigger.AUTOMATIC)
     }
 
-    fun refreshManagement() {
-        if (!state.value.paired) return
-        runOperation { loadManagement() }
+    fun refreshManagement(userInitiated: Boolean = true) {
+        if (!state.value.paired || state.value.busy || managementRefresh?.isActive == true) return
+        managementRefresh = viewModelScope.launch {
+            mutable.update { it.copy(managementRefreshing = true) }
+            try {
+                mutationLock.withLock { loadManagement(if (userInitiated) JournalTrigger.USER else JournalTrigger.AUTOMATIC) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                handleError(e)
+            } finally {
+                mutable.update { it.copy(managementRefreshing = false) }
+            }
+        }
     }
     fun selectOrigin(origin: String) {
         if (state.value.busy || origin == state.value.origin) return
         runOperation {
-            if (state.value.paired) repository.endManagement()
-            repository.selectOrigin(origin)
+            if (state.value.paired) {
+                recorded(JournalAction.AUTHORIZATION_END) { repository.endManagement() }
+                publishManagement()
+            }
+            recorded(JournalAction.ORIGIN_CHANGE) { repository.selectOrigin(origin) }
             mutable.update { it.copy(origin = origin, target = null, server = "尚未检测", waiting = false, waitUntil = null) }
             noticeChannel.trySend("线路已切换，未重发唤醒请求")
             if (state.value.paired) {
@@ -184,22 +218,26 @@ class WolViewModel(application: Application) : AndroidViewModel(application) {
         val record = state.value.wake ?: return
         runOperation {
             try {
-                val result = repository.queryWake(record)
+                val result = recorded(JournalAction.WAKE_POLL, requestId = record.requestId) { repository.queryWake(record) }
                 repository.rememberWake(result)
+                recordWakeResult(result, JournalTrigger.USER)
                 mutable.update { it.copy(wake = result, resultText = resultLabel(result), server = "可达", target = if (result.result == "unknown") null else it.target) }
                 if (result.result == "sent") beginWaiting(result)
             } catch (e: ApiException) {
                 if (e.status != 404) throw e
                 val unknown = record.copy(result = "unknown", gatewayConfirmed = false)
                 repository.rememberWake(unknown)
+                recordWakeResult(unknown, JournalTrigger.USER)
                 mutable.update { it.copy(wake = unknown, resultText = "网关尚无此请求记录。可明确重试原请求，仍使用相同 ID；不会自动补发。", server = "可达") }
             }
         }
     }
     fun authorizeManagement(activity: Activity) = runOperation {
         val openBrowser = state.value.autoOpenBrowser
-        val granted = repository.authorizeManagement(activity)
-        publishManagement()
+        val granted = recorded(JournalAction.AUTHORIZATION_START, minutes = repository.sessionMinutes, allDevices = repository.allowAllDevices) {
+            repository.authorizeManagement(activity)
+        }
+        publishManagement(replace = true)
         noticeChannel.trySend(if (granted.isPermanent) "已永久授权管理，可手动取消" else "已授权管理 ${granted.sessionMinutes} 分钟")
         if (openBrowser) launchManagementBrowser(activity)
     }
@@ -207,10 +245,12 @@ class WolViewModel(application: Application) : AndroidViewModel(application) {
         launchManagementBrowser(activity)
     }
     private suspend fun launchManagementBrowser(activity: Activity) {
-        val url = repository.managementBrowserUrl()
-        publishManagement()
         try {
-            activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).addCategory(Intent.CATEGORY_BROWSABLE))
+            recorded(JournalAction.AUTHORIZATION_BROWSER) {
+                val url = repository.managementBrowserUrl()
+                publishManagement()
+                activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).addCategory(Intent.CATEGORY_BROWSABLE))
+            }
         } catch (_: ActivityNotFoundException) {
             mutable.update { it.copy(message = "未找到可用浏览器，管理授权未取消。安装浏览器后可再次打开，也可手动取消。") }
         } catch (_: SecurityException) {
@@ -218,19 +258,28 @@ class WolViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
     fun endManagement() = runOperation {
-        repository.endManagement()
+        recorded(JournalAction.AUTHORIZATION_END) { repository.endManagement() }
         publishManagement()
         noticeChannel.trySend("管理授权已取消，唤醒功能不受影响")
     }
-    private suspend fun loadManagement() {
+    private suspend fun loadManagement(trigger: JournalTrigger = JournalTrigger.AUTOMATIC) {
         managementRefreshRequested = false
-        try { repository.managementStatus() }
+        try {
+            recorded(JournalAction.AUTHORIZATION_STATUS, trigger = trigger) { repository.managementStatus() }
+        }
         finally { publishManagement() }
     }
-    private fun publishManagement() {
+    private suspend fun publishManagement(replace: Boolean = false) {
         val granted = repository.management
         mutable.update { it.copy(management = granted, managementKnown = repository.managementKnown,
             managementPending = repository.managementPending) }
+        try {
+            reminders.update(granted, repository.managementKnown, repository.managementPending, replace)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            journal.record(JournalEvent(JournalAction.REMINDER_SCHEDULE, JournalOutcome.FAILURE, error = JournalError.STORAGE))
+        }
         managementExpiry?.cancel()
         managementExpiry = granted?.takeUnless { it.isPermanent }?.let { authorization ->
             viewModelScope.launch {
@@ -249,15 +298,19 @@ class WolViewModel(application: Application) : AndroidViewModel(application) {
         val pending = record.copy(result = "pending")
         // Commit the exact ID before any network operation. Process death must not mint a retry ID.
         repository.rememberWake(pending)
+        journal.record(JournalEvent(JournalAction.WAKE_SUBMIT, JournalOutcome.STARTED,
+            origin = repository.origin, requestId = pending.requestId, wakeStage = WakeStage.SUBMITTED, target = JournalTarget.DESKTOP))
         mutable.update { it.copy(wake = pending, resultText = "请求中…", wasOnline = wasOnline, waiting = false, waitUntil = null) }
         try {
             val result = repository.sendWake(pending)
             repository.rememberWake(result)
+            recordWakeResult(result, JournalTrigger.USER)
             mutable.update { it.copy(wake = result, resultText = resultLabel(result), server = "可达", target = if (result.result == "unknown") null else it.target) }
             if (result.result == "sent" || result.result == "pending") beginWaiting(result)
         } catch (e: Exception) {
             val unknown = pending.copy(result = "unknown", gatewayConfirmed = false)
             repository.rememberWake(unknown)
+            recordWakeResult(unknown, JournalTrigger.USER, e)
             mutable.update { it.copy(wake = unknown, resultText = "请求结果未知。不会自动重发；请查询原请求，或明确重试相同 ID。") }
             throw e
         }
@@ -271,9 +324,19 @@ class WolViewModel(application: Application) : AndroidViewModel(application) {
         }
         mutable.update { it.copy(waiting = true, waitUntil = deadline, resultText = if (record.result != "sent") "请求处理中，正在查询原请求…" else if (it.wasOnline) "电脑当前已在线；唤醒包已发送" else "已发送，等待新的在线探测…") }
     }
-    private suspend fun loadTarget(fresh: Boolean = false) {
-        val target = repository.target(fresh)
+    private suspend fun loadTarget(fresh: Boolean = false, trigger: JournalTrigger = if (fresh) JournalTrigger.USER else JournalTrigger.AUTOMATIC) {
+        val target = recorded(JournalAction.TARGET_CHECK, trigger = trigger) {
+            repository.target(fresh)
+        }
         currentCoroutineContext().ensureActive()
+        val before = state.value
+        val observedWake = before.wake ?: target.lastWake
+        val confirmed = before.waiting && observedWake?.result == "sent" && target.router == "available" &&
+            target.reachability == "reachable" && target.checkedAt != null && observedWake.sentAt != null &&
+            target.checkedAt.isAfter(observedWake.sentAt)
+        if (confirmed) journal.record(JournalEvent(JournalAction.WAKE_ONLINE, JournalOutcome.SUCCESS, JournalTrigger.AUTOMATIC,
+            origin = repository.origin, requestId = observedWake?.requestId, wakeStage = WakeStage.CONFIRMED_ONLINE,
+            target = JournalTarget.DESKTOP, reachability = JournalReachability.REACHABLE, router = JournalRouter.AVAILABLE))
         mutable.update { old ->
             val wake = old.wake ?: target.lastWake
             val newlyReachable = old.waiting && wake?.result == "sent" && target.router == "available" && target.reachability == "reachable" &&
@@ -295,13 +358,17 @@ class WolViewModel(application: Application) : AndroidViewModel(application) {
                     val until = state.value.waitUntil
                     if (until != null && !Instant.now().isBefore(until)) {
                         mutable.update { it.copy(waiting = false, resultText = if (it.wake?.result == "sent") "已发送，暂未确认上线" else "请求结果未知，请查询原请求") }
+                        state.value.wake?.let { journal.record(JournalEvent(JournalAction.WAKE_POLL, JournalOutcome.UNKNOWN,
+                            JournalTrigger.AUTOMATIC, origin = repository.origin, requestId = it.requestId,
+                            wakeStage = if (it.result == "sent") WakeStage.ONLINE_UNCONFIRMED else WakeStage.UNKNOWN, target = JournalTarget.DESKTOP)) }
                     } else if (until != null && foreground && state.value.waiting) {
                         try {
                             val record = state.value.wake
                             if (record?.result == "pending") {
-                                val result = repository.queryWake(record)
+                                val result = recorded(JournalAction.WAKE_POLL, JournalTrigger.AUTOMATIC, record.requestId) { repository.queryWake(record) }
                                 repository.rememberWake(result)
                                 currentCoroutineContext().ensureActive()
+                                recordWakeResult(result, JournalTrigger.AUTOMATIC)
                                 mutable.update { it.copy(wake = result) }
                                 if (result.result == "failed" || result.result == "unknown") {
                                     mutable.update { it.copy(waiting = false, resultText = resultLabel(result)) }
@@ -320,10 +387,14 @@ class WolViewModel(application: Application) : AndroidViewModel(application) {
         val priorPoll = poll
         poll = null
         priorPoll?.cancel()
+        val priorRefresh = managementRefresh
+        managementRefresh = null
+        priorRefresh?.cancel()
         mutable.update { it.copy(busy = true, message = if (clearMessage) null else it.message) }
         operation = viewModelScope.launch {
             try {
                 priorPoll?.cancelAndJoin()
+                priorRefresh?.cancelAndJoin()
                 mutationLock.withLock {
                     try { block() }
                     catch (e: CancellationException) { throw e }
@@ -342,6 +413,7 @@ class WolViewModel(application: Application) : AndroidViewModel(application) {
         if (error is IdentityLost || generateSequence<Throwable>(error) { it.cause }.any { it is KeyPermanentlyInvalidatedException }) {
             val uncertainManagement = repository.managementPending
             repository.forgetIdentity()
+            journal.record(JournalEvent(JournalAction.IDENTITY_LOST, JournalOutcome.FAILURE, error = JournalError.IDENTITY_LOST))
             mutable.update { it.copy(paired = false, target = null, wake = null, waiting = false,
                 message = "设备身份已撤销、丢失或密钥永久失效，请重新配对。旧服务器记录需通过 CLI 明确撤销。" +
                     if (uncertainManagement) "尚未确认管理授权已取消，请在服务器撤销旧设备；永久授权不会自动到期。" else "") }
@@ -367,7 +439,13 @@ class WolViewModel(application: Application) : AndroidViewModel(application) {
                 "not_found" -> "未找到请求或设备。"
                 else -> "服务暂时无法完成操作，请稍后重试。"
             }
-            is NetworkException -> "当前线路连接失败（网络或 TLS）。"
+            is NetworkException -> when (error.kind) {
+                NetworkFailureKind.DNS -> "当前线路域名解析失败，请检查网络或系统 VPN。"
+                NetworkFailureKind.TLS -> "当前线路 TLS 验证失败，未降低连接安全要求。"
+                NetworkFailureKind.TIMEOUT -> "当前线路连接或读取超时，不能据此判断电脑已关机。"
+                NetworkFailureKind.CONNECTION -> "当前线路连接失败，请检查网络或系统 VPN。"
+                NetworkFailureKind.OTHER -> "当前线路网络请求失败。"
+            }
             is IllegalArgumentException -> "输入或服务响应无效，请检查输入并刷新状态；配对码应为 32 位，设备名称最多 64 个字符。"
             else -> "操作未完成，请刷新状态后重试。若配对提交时断网，请在服务器检查设备记录后重新签发配对码。"
         }
@@ -381,6 +459,107 @@ class WolViewModel(application: Application) : AndroidViewModel(application) {
                 target = if (error is NetworkException || (error is ApiException && error.status >= 500)) null else it.target)
         }
     }
+
+    private suspend fun <T> recorded(
+        action: JournalAction, trigger: JournalTrigger = JournalTrigger.USER, requestId: String? = null,
+        minutes: Int? = null, allDevices: Boolean? = null, block: suspend () -> T
+    ): T {
+        val origin = repository.origin
+        val started = SystemClock.elapsedRealtime()
+        if (trigger == JournalTrigger.USER) journal.record(JournalEvent(action, JournalOutcome.STARTED, trigger,
+            origin = origin, requestId = requestId, authorizationMinutes = minutes, allowAllDevices = allDevices))
+        try {
+            val result = block()
+            val grant = result as? ManagementAuthorization
+            val target = result as? Target
+            journal.record(JournalEvent(action, JournalOutcome.SUCCESS, trigger,
+                origin = if (action == JournalAction.ORIGIN_CHANGE) repository.origin else origin, requestId = requestId,
+                durationMs = SystemClock.elapsedRealtime() - started, authorizationMinutes = grant?.sessionMinutes ?: minutes,
+                allowAllDevices = grant?.allowAllDevices ?: allDevices, reachability = target?.let { reachability(it.reachability) },
+                router = target?.let { if (it.router == "available") JournalRouter.AVAILABLE else JournalRouter.UNAVAILABLE }))
+            return result
+        } catch (e: Exception) {
+            journal.record(JournalEvent(action, operationFailureOutcome(action, e, repository.managementPending && !repository.managementKnown),
+                trigger, origin = origin, requestId = requestId, httpStatus = (e as? ApiException)?.status,
+                error = journalError(e), durationMs = SystemClock.elapsedRealtime() - started))
+            throw e
+        }
+    }
+
+    private fun recordWakeResult(record: WakeRecord, trigger: JournalTrigger, error: Exception? = null) {
+        val stage = when (record.result) {
+            "sent" -> WakeStage.SENT
+            "pending" -> WakeStage.PENDING
+            "failed" -> WakeStage.FAILED
+            else -> WakeStage.UNKNOWN
+        }
+        val outcome = when (stage) {
+            WakeStage.SENT -> JournalOutcome.SUCCESS
+            WakeStage.PENDING -> JournalOutcome.PENDING
+            WakeStage.FAILED -> JournalOutcome.FAILURE
+            else -> JournalOutcome.UNKNOWN
+        }
+        journal.record(JournalEvent(if (trigger == JournalTrigger.USER) JournalAction.WAKE_RESULT else JournalAction.WAKE_POLL,
+            outcome, trigger, origin = repository.origin, requestId = record.requestId, wakeStage = stage,
+            target = JournalTarget.DESKTOP, httpStatus = (error as? ApiException)?.status,
+            error = error?.let(::journalError) ?: JournalError.fromCode(record.code)))
+    }
+
+    private fun reachability(value: String) = when (value) {
+        "reachable" -> JournalReachability.REACHABLE
+        "unreachable" -> JournalReachability.UNREACHABLE
+        else -> JournalReachability.UNKNOWN
+    }
+
+    private fun journalError(error: Exception): JournalError? = when (error) {
+        is CancellationException -> null
+        is AuthenticationCancelled -> JournalError.AUTHENTICATION_CANCELLED
+        is IdentityLost -> JournalError.IDENTITY_LOST
+        is ApiException -> JournalError.fromCode(error.code)
+        is NetworkException -> when (error.kind) {
+            NetworkFailureKind.DNS -> JournalError.DNS
+            NetworkFailureKind.TLS -> JournalError.TLS
+            NetworkFailureKind.TIMEOUT -> JournalError.TIMEOUT
+            else -> JournalError.NETWORK
+        }
+        else -> JournalError.OTHER
+    }
+
+    internal suspend fun diagnosticTarget(): Target = mutationLock.withLock { repository.target(fresh = false) }
+
+    internal fun recordDiagnostic(report: DiagnosticReport) {
+        val outcome = when {
+            report.stages.any { it.outcome == DiagnosticOutcome.CANCELED } -> JournalOutcome.CANCELLED
+            report.stages.any { it.outcome == DiagnosticOutcome.FAILURE } -> JournalOutcome.FAILURE
+            report.stages.any { it.outcome == DiagnosticOutcome.UNKNOWN } -> JournalOutcome.UNKNOWN
+            else -> JournalOutcome.SUCCESS
+        }
+        journal.record(JournalEvent(JournalAction.CONNECTION_CHECK, outcome, origin = repository.origin, durationMs = report.elapsedMs))
+    }
+
+    internal fun identityRevoked() {
+        poll?.cancel()
+        managementRefresh?.cancel()
+        operation?.cancel()
+        managementExpiry?.cancel()
+        mutable.update { ScreenState(origin = repository.origin, sessionMinutes = repository.sessionMinutes,
+            autoOpenBrowser = repository.autoOpenBrowser, allowAllDevices = repository.allowAllDevices,
+            warnAllDevices = repository.warnAllDevices, message = "此手机已撤销，访问权限已关闭。需要新配对码才能重新连接。") }
+        viewModelScope.launch { clearReminders() }
+    }
+
+    private suspend fun clearReminders() {
+        try { reminders.clear() }
+        catch (e: CancellationException) { throw e }
+        catch (_: Exception) { journal.record(JournalEvent(JournalAction.REMINDER_CANCEL, JournalOutcome.FAILURE, error = JournalError.STORAGE)) }
+    }
+}
+
+internal fun operationFailureOutcome(action: JournalAction, error: Exception, managementUncertain: Boolean): JournalOutcome = when {
+    error is AuthenticationCancelled -> JournalOutcome.CANCELLED
+    managementUncertain && (action == JournalAction.AUTHORIZATION_START || action == JournalAction.AUTHORIZATION_END) -> JournalOutcome.UNKNOWN
+    error is CancellationException -> JournalOutcome.CANCELLED
+    else -> JournalOutcome.FAILURE
 }
 
 fun resultLabel(record: WakeRecord): String = when (record.result) {

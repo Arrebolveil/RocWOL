@@ -27,6 +27,7 @@ type challenge struct {
 	Kind, Device, Origin, CodeHash, Name, Wake, Manage string
 	SessionMinutes                                     int
 	AllowAllDevices                                    bool
+	Action, Target                                     string
 }
 type grant struct {
 	Device, Origin, Authorization string
@@ -521,6 +522,12 @@ func (s *State) EndManagement(device string) error {
 func (s *State) Revoke(device string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.revokeLocked(device)
+}
+
+// revokeLocked is shared by local recovery and signed device administration.
+// The caller holds mu so authorization and revocation are one atomic action.
+func (s *State) revokeLocked(device string) error {
 	if e := s.db.Revoke(device); e != nil {
 		return e
 	}

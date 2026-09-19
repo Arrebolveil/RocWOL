@@ -15,12 +15,13 @@ var ErrUnavailable = errors.New("record unavailable")
 var ErrCapacity = errors.New("capacity reached")
 
 type Device struct {
-	DeviceID   string    `json:"deviceId"`
-	DeviceName string    `json:"deviceName"`
-	WakeKey    string    `json:"wakePublicKey"`
-	ManageKey  string    `json:"managePublicKey"`
-	CreatedAt  time.Time `json:"createdAt"`
-	Revoked    bool      `json:"revoked"`
+	DeviceID             string    `json:"deviceId"`
+	DeviceName           string    `json:"deviceName"`
+	WakeKey              string    `json:"wakePublicKey"`
+	ManageKey            string    `json:"managePublicKey"`
+	CreatedAt            time.Time `json:"createdAt"`
+	Revoked              bool      `json:"revoked"`
+	DeviceAdministration bool      `json:"deviceAdministration"`
 }
 type WakeRecord struct {
 	protocol.Wake
@@ -87,6 +88,8 @@ func (s *Store) CodeValid(hash string, now time.Time) bool {
 	return ok
 }
 func (s *Store) Register(hash string, d Device, now time.Time) error {
+	// Pairing never grants device administration; only the local admin socket may.
+	d.DeviceAdministration = false
 	return s.DB.Update(func(tx *bolt.Tx) error {
 		codes := tx.Bucket([]byte("codes"))
 		var expires time.Time
@@ -151,6 +154,24 @@ func (s *Store) Revoke(id string) error {
 			return e
 		}
 		d.Revoked = true
+		return put(b, id, d)
+	})
+}
+func (s *Store) SetDeviceAdministration(id string, enabled bool) error {
+	return s.DB.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte("devices"))
+		var d Device
+		v := b.Get([]byte(id))
+		if v == nil {
+			return ErrUnavailable
+		}
+		if e := json.Unmarshal(v, &d); e != nil {
+			return e
+		}
+		if d.Revoked {
+			return ErrUnavailable
+		}
+		d.DeviceAdministration = enabled
 		return put(b, id, d)
 	})
 }

@@ -25,6 +25,7 @@ Usage:
   roc-wol pair-code --socket /run/roc-wol/admin.sock --ttl 10m
   roc-wol devices list --socket /run/roc-wol/admin.sock
   roc-wol devices revoke --socket /run/roc-wol/admin.sock --id DEVICE_ID
+  roc-wol devices admin --socket /run/roc-wol/admin.sock --id DEVICE_ID --enabled=true|false
   roc-wol --help
 
 Administration uses a local, filesystem-protected Unix socket only.
@@ -83,11 +84,12 @@ func run(args []string) error {
 		return nil
 	case "devices":
 		if len(args) < 2 {
-			return errors.New("devices requires list or revoke")
+			return errors.New("devices requires list, revoke or admin")
 		}
 		f := flag.NewFlagSet("devices "+args[1], flag.ContinueOnError)
 		socket := f.String("socket", "/run/roc-wol/admin.sock", "local administration socket")
-		id := f.String("id", "", "device ID to revoke")
+		id := f.String("id", "", "device ID to administer")
+		enabled := f.String("enabled", "", "explicit true or false device-administration capability")
 		if e := f.Parse(args[2:]); e != nil {
 			if errors.Is(e, flag.ErrHelp) {
 				return nil
@@ -107,8 +109,13 @@ func run(args []string) error {
 				return errors.New("revoke requires --id")
 			}
 			data, e = admin(*socket, "POST", "/devices/revoke", map[string]string{"deviceId": *id})
+		case "admin":
+			if *id == "" || (*enabled != "true" && *enabled != "false") {
+				return errors.New("admin requires --id and --enabled=true|false")
+			}
+			data, e = admin(*socket, "POST", "/devices/admin", map[string]any{"deviceId": *id, "enabled": *enabled == "true"})
 		default:
-			return errors.New("devices requires list or revoke")
+			return errors.New("devices requires list, revoke or admin")
 		}
 		if e != nil {
 			return e
