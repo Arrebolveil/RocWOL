@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.NotificationManager
 import android.content.Context
 import android.os.Build
+import android.os.SystemClock
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import kotlinx.coroutines.runBlocking
@@ -51,8 +52,16 @@ class ReminderIsolationTest {
                 reminders.deliver(id, generations[index])
             }
             fun activeIds() = notifications.activeNotifications.filter { it.id == 4101 }.map { it.tag }.toSet()
-            assertTrue(activeIds().containsAll(ids))
+            suspend fun awaitActiveIds(expected: Set<String>) {
+                val deadline = SystemClock.elapsedRealtime() + 5000
+                while (activeIds().filter { it in ids }.toSet() != expected && SystemClock.elapsedRealtime() < deadline) {
+                    kotlinx.coroutines.delay(25)
+                }
+                assertEquals(expected, activeIds().filter { it in ids }.toSet())
+            }
+            awaitActiveIds(ids.toSet())
             reminders.clear(ids[0])
+            awaitActiveIds(setOf(ids[1]))
             assertFalse(activeIds().contains(ids[0]))
             assertTrue(activeIds().contains(ids[1]))
             reminders.deliver(ids[0], generations[0])
