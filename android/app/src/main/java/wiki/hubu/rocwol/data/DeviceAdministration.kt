@@ -57,36 +57,44 @@ data class DeviceRevocation(val deviceId: String, val revoked: Boolean, val curr
     }
 }
 
+data class AdministeredDeviceList(val devices: List<AdministeredDevice>, val capacity: Int)
+internal fun checkedDeviceCapacity(capacity: Int, count: Int): Int {
+    require(capacity in 1..100 && count in 1..100)
+    return capacity
+}
+
 class DeviceAdministration(private val repository: Repository) {
     suspend fun access(): DeviceAdministrationAccess {
         val id = repository.deviceId ?: throw IdentityLost()
-        val reply = repository.authenticated("/_wol/v1/devices/access")
+        val reply = repository.authenticated("/_wol/v2/devices/access")
         require(reply.status in 200..299)
         return DeviceAdministrationAccess.parse(reply.body).also { require(it.deviceId == id) }
     }
 
-    suspend fun list(activity: Activity): List<AdministeredDevice> {
-        val origin = repository.origin
+    suspend fun list(activity: Activity): AdministeredDeviceList {
+        val context = repository.operationContext(targetId = null)
+        val origin = context.origin
         try {
             val id = repository.deviceId ?: throw IdentityLost()
             val proof = authorize(activity, id, origin, "list", "", "查看已配对设备")
-            val reply = repository.authenticated("/_wol/v1/devices/list", proof, requestOrigin = origin)
+            val reply = repository.authenticated("/_wol/v2/devices/list", proof, requestOrigin = origin)
             require(reply.status in 200..299)
             val rows = reply.body.getJSONArray("devices")
-            require(rows.length() in 1..5)
+            val capacity = checkedDeviceCapacity(reply.body.getInt("capacity"), rows.length())
             val devices = List(rows.length()) { AdministeredDevice.parse(rows.getJSONObject(it)) }
             require(devices.map { it.deviceId }.distinct().size == devices.size)
             require(devices.count { it.current } == 1 && devices.all { it.current == (it.deviceId == id) })
-            repository.journal.record(JournalEvent(JournalAction.DEVICE_LIST, JournalOutcome.SUCCESS, origin = origin, httpStatus = reply.status))
-            return devices
+            repository.journal.record(JournalEvent(JournalAction.DEVICE_LIST, JournalOutcome.SUCCESS, context = context, httpStatus = reply.status))
+            return AdministeredDeviceList(devices, capacity)
         } catch (failure: Exception) {
-            recordFailure(JournalAction.DEVICE_LIST, origin, failure)
+            recordFailure(JournalAction.DEVICE_LIST, context, failure)
             throw failure
         }
     }
 
     suspend fun revoke(activity: Activity, target: AdministeredDevice): DeviceRevocation {
-        val origin = repository.origin
+        val context = repository.operationContext(targetId = null)
+        val origin = context.origin
         var submitted = false
         try {
             val id = repository.deviceId ?: throw IdentityLost()
@@ -95,19 +103,19 @@ class DeviceAdministration(private val repository: Repository) {
                 "撤销「${target.deviceName}」${if (target.current) "（当前手机）" else ""}")
                 .put("targetDeviceId", target.deviceId)
             submitted = true
-            val reply = repository.authenticated("/_wol/v1/devices/revoke", proof, requestOrigin = origin)
+            val reply = repository.authenticated("/_wol/v2/devices/revoke", proof, requestOrigin = origin)
             require(reply.status in 200..299)
             val result = DeviceRevocation.parse(reply.body)
             require(result.deviceId == target.deviceId && result.current == target.current)
-            repository.journal.record(JournalEvent(JournalAction.DEVICE_REVOKE, JournalOutcome.SUCCESS, origin = origin, httpStatus = reply.status))
+            repository.journal.record(JournalEvent(JournalAction.DEVICE_REVOKE, JournalOutcome.SUCCESS, context = context, httpStatus = reply.status))
             return result
         } catch (failure: Exception) {
-            recordFailure(JournalAction.DEVICE_REVOKE, origin, failure, submitted)
+            recordFailure(JournalAction.DEVICE_REVOKE, context, failure, submitted)
             throw failure
         }
     }
 
-    private fun recordFailure(action: JournalAction, origin: String, failure: Exception, submitted: Boolean = false) {
+    private fun recordFailure(action: JournalAction, context: OperationContext, failure: Exception, submitted: Boolean = false) {
         val error = when (failure) {
             is ApiException -> JournalError.fromCode(failure.code)
             is NetworkException -> when (failure.kind) {
@@ -122,12 +130,12 @@ class DeviceAdministration(private val repository: Repository) {
             else -> JournalError.INVALID_RESPONSE
         }
         val outcome = administrationFailureOutcome(failure, submitted)
-        repository.journal.record(JournalEvent(action, outcome, origin = origin,
+        repository.journal.record(JournalEvent(action, outcome, context = context,
             httpStatus = (failure as? ApiException)?.status, error = error))
     }
 
     private suspend fun authorize(activity: Activity, id: String, origin: String, action: String, target: String, purpose: String): JSONObject {
-        val reply = repository.authenticated("/_wol/v1/devices/challenge", JSONObject()
+        val reply = repository.authenticated("/_wol/v2/devices/challenge", JSONObject()
             .put("origin", origin).put("action", action).put("targetDeviceId", target), requestOrigin = origin)
         require(reply.status in 200..299)
         val challenge = Challenge.parse(reply.body)

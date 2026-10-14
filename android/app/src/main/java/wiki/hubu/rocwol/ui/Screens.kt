@@ -38,6 +38,7 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.isImeVisible
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
@@ -126,7 +127,7 @@ import java.time.format.DateTimeFormatter
 
 @OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
-fun RocApp(activity: Activity, model: WolViewModel, managementRequest: Int = 0) {
+fun RocApp(activity: Activity, model: WolViewModel) {
     val state by model.state.collectAsStateWithLifecycle()
     val themeSettings = rememberThemeSettings()
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -141,17 +142,15 @@ fun RocApp(activity: Activity, model: WolViewModel, managementRequest: Int = 0) 
     }
     var showProgress by remember { mutableStateOf(false) }
     // A reminder may open Management, but never starts an authorization.
-    var tab by remember { mutableIntStateOf(if (activity.intent?.getBooleanExtra("open_management", false) == true) 1 else 0) }
+    var tab by remember { mutableIntStateOf(0) }
+    var manageServers by remember { mutableStateOf(false) }
     val wakeScroll = rememberScrollState()
     val managementScroll = rememberScrollState()
     val settingsScroll = rememberScrollState()
     val travel = with(LocalDensity.current) { 32.dp.roundToPx() }
     val layoutDirection = if (LocalLayoutDirection.current == LayoutDirection.Rtl) -1 else 1
-    LaunchedEffect(managementRequest) {
-        if (managementRequest > 0) {
-            focusManager.clearFocus()
-            tab = 1
-        }
+    LaunchedEffect(state.managementNavigation) {
+        if (state.managementNavigation > 0) { focusManager.clearFocus(); tab = 1 }
     }
     LaunchedEffect(tab, state.paired) {
         if (tab == 1 && state.paired) model.refreshManagement(userInitiated = false)
@@ -236,21 +235,27 @@ fun RocApp(activity: Activity, model: WolViewModel, managementRequest: Int = 0) 
                                 while (true) awaitPointerEvent(PointerEventPass.Initial).changes.forEach { it.consume() }
                             }
                         }
-                    Column(Modifier.fillMaxSize().then(inactive).verticalScroll(scroll).padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                    Column(Modifier.align(Alignment.TopCenter).widthIn(max = 840.dp).fillMaxSize().then(inactive).verticalScroll(scroll).padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
                         Text(when (page) { 0 -> "网络唤醒"; 1 -> "路由器管理"; else -> "设置" }, style = MaterialTheme.typography.headlineMedium)
-                        MotionText("当前线路：${if (pageState.origin == Origins.all.first()) "直连（默认）" else "Cloudflare 备用"}", MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        when (page) {
-                            0 -> AnimatedContent(
-                                targetState = pageState.paired,
-                                transitionSpec = { fadeIn(tween(220, delayMillis = 60)) togetherWith fadeOut(tween(100)) },
-                                label = "Pairing transition"
-                            ) { paired ->
-                                Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                                    val contentState = if (paired == pageState.paired) pageState else pageState.copy(busy = true)
-                                    if (paired) WakePage(model, contentState) else Pairing(activity, model, contentState)
-                                }
+                        ServerSelector(model, pageState) { manageServers = true }
+                        MotionText(if (pageState.switching) "正在结束检查…" else pageState.activeProfile?.origins?.firstOrNull { it.origin == pageState.origin }?.let { "当前线路：${it.routeIndex}" } ?: "尚未配置可联网线路", MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        when {
+                            !pageState.ready -> {
+                                Text("正在升级本机存储；升级完成前不会联网。")
+                                TextButton(onClick = model::startup) { Text("重试升级") }
                             }
-                            1 -> ManagementPage(activity, model, pageState, current)
+                            pageState.activeProfileId == null -> {
+                                Text("添加你的服务器", style = MaterialTheme.typography.titleLarge)
+                                Text("没有默认服务地址。添加你控制的 HTTPS 服务器后再配对。")
+                                Button(onClick = { manageServers = true }) { Text("管理服务器") }
+                                if (page == 2) SettingsUtilities(activity, model, pageState)
+                            }
+                            pageState.origin.isEmpty() -> {
+                                Text("原有身份已保留，请验证原服务地址后继续。")
+                                Button(onClick = { manageServers = true }) { Text("恢复服务器线路") }
+                            }
+                            page == 0 -> if (pageState.paired) WakePage(model, pageState) else Pairing(activity, model, pageState)
+                            page == 1 -> ManagementPage(activity, model, pageState, current)
                             else -> SettingsPage(activity, model, pageState, themeSettings.mode) { if (current) themeSettings.select(it) }
                         }
                         Spacer(Modifier.height(8.dp))
@@ -261,6 +266,17 @@ fun RocApp(activity: Activity, model: WolViewModel, managementRequest: Int = 0) 
                 }
             }
         }
+        if (manageServers) UtilityWindow(onBack = { manageServers = false }) {
+            ServerProfilesScreen(model) { manageServers = false }
+        }
+        MotionAlertDialog(
+            visible = state.confirmLocalRemoval,
+            onDismissRequest = model::dismissConfirmation,
+            title = "服务器授权可能仍有效",
+            text = "未能确认授权已结束。仅从本机移除不会撤销服务器设备；请在服务器撤销设备，永久授权不会自动到期。",
+            confirmText = "仅从本机移除", onConfirm = model::confirmLocalRemoval,
+            dismissText = "保留并重试", enabled = !state.switchingLocked
+        )
         MotionAlertDialog(
             visible = state.confirmNewWake,
             onDismissRequest = model::dismissConfirmation,
@@ -348,8 +364,8 @@ private fun MotionAlertDialog(
 
 @Composable
 private fun Pairing(activity: Activity, model: WolViewModel, state: ScreenState) {
-    var code by remember { mutableStateOf("") }
-    var name by remember { mutableStateOf(state.deviceName) }
+    var code by remember(state.activeProfileId) { mutableStateOf("") }
+    var name by remember(state.activeProfileId) { mutableStateOf(state.deviceName) }
     val focusManager = LocalFocusManager.current
     val keyboard = LocalSoftwareKeyboardController.current
     val codeFocus = remember { FocusRequester() }
@@ -387,8 +403,19 @@ private fun Pairing(activity: Activity, model: WolViewModel, state: ScreenState)
 private fun WakePage(model: WolViewModel, state: ScreenState) {
     Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)) {
         Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("固定目标", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            Text(state.target?.name ?: "DESKTOP-IENBTJG", style = MaterialTheme.typography.titleLarge)
+            Text("${state.activeProfile?.displayName.orEmpty()} · 电脑", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(state.target?.name ?: state.targets.firstOrNull { it.targetId == state.selectedTargetId }?.name ?: "请选择电脑", style = MaterialTheme.typography.titleLarge)
+            if (state.targetsCached) Text("缓存清单 · 离线时禁止提交唤醒", color = MaterialTheme.colorScheme.tertiary)
+            Column(Modifier.selectableGroup()) {
+                state.targets.forEach { computer ->
+                    Row(Modifier.fillMaxWidth().heightIn(min = 56.dp).selectable(selected = state.selectedTargetId == computer.targetId,
+                        enabled = !state.switchingLocked && !state.switching, role = Role.RadioButton,
+                        onClick = { model.selectTarget(computer.targetId) }), verticalAlignment = Alignment.CenterVertically) {
+                        RadioButton(state.selectedTargetId == computer.targetId, onClick = null)
+                        Text(computer.name, Modifier.padding(start = 12.dp))
+                    }
+                }
+            }
             StatusLine("服务器", state.server, state.server == "可达")
             StatusLine("路由器", when (state.target?.router) { "available" -> "可达"; "unavailable" -> "不可达"; else -> "未知" }, state.target?.router == "available")
             StatusLine("电脑探测", when (state.target?.reachability) { "reachable" -> "在线"; "unreachable" -> "不在线"; else -> "未知" }, state.target?.reachability == "reachable")
@@ -399,7 +426,7 @@ private fun WakePage(model: WolViewModel, state: ScreenState) {
         }
     }
     val retryOriginal = state.wake?.let { !it.gatewayConfirmed && it.result in setOf("pending", "unknown") && it.createdAt.isAfter(java.time.Instant.now().minusSeconds(86_400)) } == true
-    PrimaryAction(if (retryOriginal) "重试原唤醒请求（相同 ID）" else "唤醒电脑", onClick = model::requestWake, enabled = !state.busy, minHeight = 60.dp)
+    PrimaryAction(if (retryOriginal) "重试原唤醒请求（相同 ID）" else "唤醒当前电脑", onClick = if (retryOriginal) model::retryOriginal else model::requestWake, enabled = !state.busy && state.targetsAvailable && state.selectedTargetId != null && !state.switching, minHeight = 60.dp)
     LastResult(model, state)
     WakeHistoryAction(model)
     Text("仅支持远程唤醒，不提供关机功能。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -467,11 +494,12 @@ private fun SettingsPage(activity: Activity, model: WolViewModel, state: ScreenS
         Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("连接线路", style = MaterialTheme.typography.titleMedium)
             Column(Modifier.selectableGroup()) {
-                Origins.all.forEachIndexed { index, origin ->
+                state.activeProfile?.origins.orEmpty().forEach { route ->
+                    val origin = route.origin
                     Row(Modifier.fillMaxWidth().heightIn(min = 72.dp).selectable(selected = state.origin == origin, enabled = !state.busy, role = Role.RadioButton, onClick = { model.selectOrigin(origin) }), verticalAlignment = Alignment.CenterVertically) {
                         RadioButton(selected = state.origin == origin, onClick = null, enabled = !state.busy)
                         Column(Modifier.padding(start = 12.dp).weight(1f)) {
-                            Text(if (index == 0) "直连（默认）" else "Cloudflare 备用", style = MaterialTheme.typography.bodyLarge)
+                            Text("线路 ${route.routeIndex}", style = MaterialTheme.typography.bodyLarge)
                             Text(origin, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                     }
@@ -482,10 +510,12 @@ private fun SettingsPage(activity: Activity, model: WolViewModel, state: ScreenS
     }
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("固定目标", style = MaterialTheme.typography.titleMedium)
-            Text(state.target?.name ?: "DESKTOP-IENBTJG", style = MaterialTheme.typography.bodyLarge)
-            Text("MAC  ${state.target?.mac ?: "B0:25:AA:83:C6:EF"}", style = MaterialTheme.typography.bodyMedium)
-            Text("IP  ${state.target?.ip ?: "192.168.2.100"}", style = MaterialTheme.typography.bodyMedium)
+            Text("当前电脑（只读）", style = MaterialTheme.typography.titleMedium)
+            Text(state.target?.name ?: "尚无电脑状态", style = MaterialTheme.typography.bodyLarge)
+            state.target?.let { target ->
+                Text("MAC  ${target.mac}", style = MaterialTheme.typography.bodyMedium)
+                Text("IP  ${target.ip}", style = MaterialTheme.typography.bodyMedium)
+            }
             Text("目标由部署端维护，App 内只读。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
@@ -499,9 +529,15 @@ private fun SettingsPage(activity: Activity, model: WolViewModel, state: ScreenS
 @OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
 private fun ManagementPage(activity: Activity, model: WolViewModel, state: ScreenState, current: Boolean) {
+    Text("${state.activeProfile?.displayName.orEmpty()}的路由器管理；范围不随所选电脑改变。", style = MaterialTheme.typography.bodyMedium)
+    if (!state.managementEnabled) {
+        Text("此服务器未启用路由器管理", color = MaterialTheme.colorScheme.tertiary)
+        if (state.managementPending || state.management != null) TextButton(onClick = model::endManagement, enabled = !state.busy) { Text("取消旧授权") }
+        return
+    }
     var now by remember { mutableStateOf(Instant.now()) }
-    var confirmAllDevices by remember { mutableStateOf(false) }
-    var confirmPermanent by remember { mutableStateOf(false) }
+    var confirmAllDevices by remember(state.activeProfileId) { mutableStateOf(false) }
+    var confirmPermanent by remember(state.activeProfileId) { mutableStateOf(false) }
     val authorization = state.management
     val lifecycleOwner = LocalLifecycleOwner.current
     var showRefreshProgress by remember { mutableStateOf(false) }

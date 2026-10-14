@@ -2,6 +2,7 @@
   "name": "roc-wol-operations",
   "version": "1.0.0",
   "private": true,
+  "license": "GPL-3.0-only",
   "type": "module",
   "engines": { "node": ">=24" },
   "dependencies": { "ssh2": "1.17.0" },

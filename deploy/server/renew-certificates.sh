@@ -1,57 +1,74 @@
 #!/bin/sh
 set -eu
 umask 077
-# Generated exclusively from the protected deployment configuration.
 . /etc/roc-wol/renew.env
-case "$CERTBOT_IMAGE" in certbot/certbot@sha256:*) ;; *) exit 1 ;; esac
-case "$DIRECT_HOST" in wol.hubu.wiki|wol-direct.hubu.wiki) ;; *) exit 1 ;; esac
-[ "$FALLBACK_HOST" = roc.hubu.wiki ]
+: "${DOMAINS:?}" "${WEBROOT_HOST:?}" "${TLS_DEST_HOST:?}" "${PROXY_MODE:?}"
+case "$PROXY_MODE" in
+    nginx) ;;
+    onepanel) : "${OPENRESTY_CONTAINER:?}"; docker inspect "$OPENRESTY_CONTAINER" >/dev/null ;;
+    *) exit 1 ;;
+esac
+for domain in $DOMAINS; do
+    case "$domain" in *[!a-z0-9.-]*|'') exit 1 ;; esac
+done
+case "$WEBROOT_HOST:$TLS_DEST_HOST" in *'/../'*|*'/./'*) exit 1 ;; esac
+case "$WEBROOT_HOST" in /*) ;; *) exit 1 ;; esac
+case "$TLS_DEST_HOST" in /*) ;; *) exit 1 ;; esac
+install_only=false
+reload=true
+for arg in "$@"; do
+    case "$arg" in --install-only) install_only=true ;; --no-reload) reload=false ;; *) exit 1 ;; esac
+done
 exec 9>/run/roc-wol-renew.lock
 flock -n 9 || exit 0
-if [ "${1:-}" != --install-only ]; then
-    docker run --rm -v /opt/roc-wol/acme/etc:/etc/letsencrypt -v /opt/1panel/apps/openresty/openresty/root:/var/www/acme "$CERTBOT_IMAGE" renew --cert-name roc-wol --webroot -w /var/www/acme --non-interactive --no-random-sleep-on-renew
+if ! $install_only; then
+    certbot renew --cert-name roc-wol --webroot -w "$WEBROOT_HOST" --non-interactive --no-random-sleep-on-renew --config-dir /opt/roc-wol/acme/etc --work-dir /opt/roc-wol/acme/work --logs-dir /opt/roc-wol/acme/logs
 fi
 live=/opt/roc-wol/acme/etc/live/roc-wol
 for file in cert.pem chain.pem fullchain.pem privkey.pem; do test -s "$live/$file"; done
 openssl x509 -in "$live/cert.pem" -noout -checkend 604800 >/dev/null
-openssl x509 -in "$live/cert.pem" -noout -checkhost "$DIRECT_HOST" >/dev/null
-openssl x509 -in "$live/cert.pem" -noout -checkhost "$FALLBACK_HOST" >/dev/null
+for domain in $DOMAINS; do openssl x509 -in "$live/cert.pem" -noout -checkhost "$domain" >/dev/null; done
 openssl verify -CApath /etc/ssl/certs -untrusted "$live/chain.pem" "$live/cert.pem" >/dev/null
 cert_key=$(openssl x509 -in "$live/cert.pem" -pubkey -noout | openssl pkey -pubin -outform DER | sha256sum)
 private_key=$(openssl pkey -in "$live/privkey.pem" -pubout -outform DER | sha256sum)
 [ "$cert_key" = "$private_key" ]
-backup=$(mktemp -d /root/roc-wol-private/tls-rollback.XXXXXX)
+mkdir -p "$TLS_DEST_HOST" /opt/roc-wol/rollback
+backup=$(mktemp -d /opt/roc-wol/rollback/tls.XXXXXX)
+changed=false
+proxy() {
+    if [ "$PROXY_MODE" = nginx ]; then nginx "$1" ${2:+"$2"};
+    else docker exec "$OPENRESTY_CONTAINER" openresty "$1" ${2:+"$2"}; fi
+}
 rollback() {
-    for host in "$DIRECT_HOST" "$FALLBACK_HOST"; do
-        dest=/opt/1panel/www/sites/$host/ssl
-        for file in fullchain.pem privkey.pem; do
-            if [ -f "$backup/$host.$file" ]; then
-                cp "$backup/$host.$file" "$dest/$file.rollback"
-                chmod 600 "$dest/$file.rollback"
-                mv -f "$dest/$file.rollback" "$dest/$file"
-            elif [ -f "$backup/$host.$file.absent" ]; then
-                rm -f "$dest/$file"
-            fi
-        done
+    for file in fullchain.pem privkey.pem; do
+        if [ -f "$backup/$file" ]; then
+            cp -p "$backup/$file" "$TLS_DEST_HOST/$file.rollback"
+            mv -f "$TLS_DEST_HOST/$file.rollback" "$TLS_DEST_HOST/$file"
+        else rm -f "$TLS_DEST_HOST/$file"; fi
+        rm -f "$TLS_DEST_HOST/$file.new"
     done
 }
-for host in "$DIRECT_HOST" "$FALLBACK_HOST"; do
-    dest=/opt/1panel/www/sites/$host/ssl
-    mkdir -p "$dest"
-    for file in fullchain.pem privkey.pem; do
-        if [ -e "$dest/$file" ]; then cp -p "$dest/$file" "$backup/$host.$file"; else touch "$backup/$host.$file.absent"; fi
-        install -m 600 "$live/$file" "$dest/$file.new"
-    done
+finish() {
+    status=$?
+    trap - EXIT HUP INT TERM
+    if [ "$status" -ne 0 ] && $changed; then
+        rollback
+        if $reload; then proxy -t >/dev/null 2>&1 && proxy -s reload >/dev/null 2>&1 || true; fi
+    fi
+    exit "$status"
+}
+trap finish EXIT
+trap 'exit 1' HUP INT TERM
+for file in fullchain.pem privkey.pem; do
+    test ! -L "$TLS_DEST_HOST/$file"
+    if [ -e "$TLS_DEST_HOST/$file" ]; then
+        cp -p "$TLS_DEST_HOST/$file" "$backup/$file"
+        sha256sum "$backup/$file" > "$backup/$file.sha256"
+    fi
+    install -m 600 "$live/$file" "$TLS_DEST_HOST/$file.new"
 done
-for host in "$DIRECT_HOST" "$FALLBACK_HOST"; do
-    dest=/opt/1panel/www/sites/$host/ssl
-    mv -f "$dest/fullchain.pem.new" "$dest/fullchain.pem"
-    mv -f "$dest/privkey.pem.new" "$dest/privkey.pem"
-done
-if ! docker exec "$OPENRESTY_CONTAINER" openresty -t >/dev/null 2>&1; then rollback; exit 1; fi
-if ! docker exec "$OPENRESTY_CONTAINER" openresty -s reload >/dev/null 2>&1; then
-    rollback
-    docker exec "$OPENRESTY_CONTAINER" openresty -t >/dev/null 2>&1 && docker exec "$OPENRESTY_CONTAINER" openresty -s reload >/dev/null 2>&1 || true
-    exit 1
-fi
+changed=true
+for file in fullchain.pem privkey.pem; do mv -f "$TLS_DEST_HOST/$file.new" "$TLS_DEST_HOST/$file"; done
+if $reload; then proxy -t >/dev/null 2>&1; proxy -s reload >/dev/null 2>&1; fi
+changed=false
 openssl x509 -in "$live/cert.pem" -noout -enddate

@@ -13,6 +13,9 @@ import (
 
 var ErrUnavailable = errors.New("record unavailable")
 var ErrCapacity = errors.New("capacity reached")
+var ErrBinding = errors.New("record binding mismatch")
+var ErrInvalidCapacity = errors.New("invalid device capacity")
+var ErrCorrupt = errors.New("invalid stored record")
 
 type Device struct {
 	DeviceID             string    `json:"deviceId"`
@@ -28,7 +31,10 @@ type WakeRecord struct {
 	DeviceID  string    `json:"deviceId"`
 	CreatedAt time.Time `json:"createdAt"`
 }
-type Store struct{ DB *bolt.DB }
+type Store struct {
+	DB         *bolt.DB
+	instanceID string
+}
 
 func Open(path string) (*Store, error) {
 	if e := os.MkdirAll(filepath.Dir(path), 0700); e != nil {
@@ -38,15 +44,8 @@ func Open(path string) (*Store, error) {
 	if e != nil {
 		return nil, e
 	}
-	s := &Store{db}
-	e = db.Update(func(tx *bolt.Tx) error {
-		for _, n := range []string{"devices", "codes", "wakes"} {
-			if _, e := tx.CreateBucketIfNotExists([]byte(n)); e != nil {
-				return e
-			}
-		}
-		return nil
-	})
+	s := &Store{DB: db}
+	s.instanceID, e = initialize(db, path)
 	if e != nil {
 		db.Close()
 		return nil, e
@@ -54,6 +53,9 @@ func Open(path string) (*Store, error) {
 	return s, nil
 }
 func (s *Store) Close() error { return s.DB.Close() }
+
+// InstanceID is generated once and persisted independently of schema upgrades.
+func (s *Store) InstanceID() string { return s.instanceID }
 func put(b *bolt.Bucket, key string, v any) error {
 	data, e := json.Marshal(v)
 	if e != nil {
@@ -87,7 +89,10 @@ func (s *Store) CodeValid(hash string, now time.Time) bool {
 	})
 	return ok
 }
-func (s *Store) Register(hash string, d Device, now time.Time) error {
+func (s *Store) Register(hash string, d Device, now time.Time, maxDevices int) error {
+	if maxDevices < 1 || maxDevices > 100 {
+		return ErrInvalidCapacity
+	}
 	// Pairing never grants device administration; only the local admin socket may.
 	d.DeviceAdministration = false
 	return s.DB.Update(func(tx *bolt.Tx) error {
@@ -97,6 +102,10 @@ func (s *Store) Register(hash string, d Device, now time.Time) error {
 			return ErrUnavailable
 		}
 		b := tx.Bucket([]byte("devices"))
+		// A pairing code must never overwrite or revive an existing identity.
+		if b.Get([]byte(d.DeviceID)) != nil {
+			return ErrUnavailable
+		}
 		count := 0
 		if e := b.ForEach(func(k, v []byte) error {
 			var old Device
@@ -110,7 +119,7 @@ func (s *Store) Register(hash string, d Device, now time.Time) error {
 		}); e != nil {
 			return e
 		}
-		if count >= 5 {
+		if count >= maxDevices {
 			return ErrCapacity
 		}
 		if e := put(b, d.DeviceID, d); e != nil {
@@ -182,7 +191,7 @@ func (s *Store) Wake(id string) (WakeRecord, error) {
 		if v == nil {
 			return ErrUnavailable
 		}
-		if e := json.Unmarshal(v, &r); e != nil {
+		if e := decodeWake(v, &r); e != nil {
 			return e
 		}
 		if time.Since(r.CreatedAt) > 7*24*time.Hour {
@@ -193,13 +202,16 @@ func (s *Store) Wake(id string) (WakeRecord, error) {
 	return r, e
 }
 func (s *Store) CreateWake(r WakeRecord) error {
+	if !validWake(r) {
+		return ErrCorrupt
+	}
 	return s.DB.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte("wakes"))
 		c := b.Cursor()
 		cutoff := time.Now().Add(-7 * 24 * time.Hour)
 		for k, v := c.First(); k != nil; k, v = c.Next() {
 			var old WakeRecord
-			if e := json.Unmarshal(v, &old); e != nil {
+			if e := decodeWake(v, &old); e != nil {
 				return e
 			}
 			if old.CreatedAt.Before(cutoff) {
@@ -215,23 +227,34 @@ func (s *Store) CreateWake(r WakeRecord) error {
 	})
 }
 func (s *Store) UpdateWake(r WakeRecord) error {
+	if !validWake(r) {
+		return ErrCorrupt
+	}
 	return s.DB.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte("wakes"))
-		if b.Get([]byte(r.RequestID)) == nil {
+		v := b.Get([]byte(r.RequestID))
+		if v == nil {
 			return ErrUnavailable
+		}
+		var old WakeRecord
+		if e := decodeWake(v, &old); e != nil {
+			return e
+		}
+		if old.DeviceID != r.DeviceID || old.TargetID != r.TargetID {
+			return ErrBinding
 		}
 		return put(b, r.RequestID, r)
 	})
 }
-func (s *Store) LastWake(device string) (*protocol.Wake, error) {
+func (s *Store) LastWake(device, targetID string) (*protocol.Wake, error) {
 	var latest WakeRecord
 	e := s.DB.View(func(tx *bolt.Tx) error {
 		return tx.Bucket([]byte("wakes")).ForEach(func(k, v []byte) error {
 			var r WakeRecord
-			if e := json.Unmarshal(v, &r); e != nil {
+			if e := decodeWake(v, &r); e != nil {
 				return e
 			}
-			if r.DeviceID == device && r.CreatedAt.After(latest.CreatedAt) && time.Since(r.CreatedAt) < 7*24*time.Hour {
+			if r.DeviceID == device && r.TargetID == targetID && r.CreatedAt.After(latest.CreatedAt) && time.Since(r.CreatedAt) < 7*24*time.Hour {
 				latest = r
 			}
 			return nil

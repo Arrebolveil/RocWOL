@@ -7,7 +7,9 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import androidx.work.CoroutineWorker
 import androidx.work.ExistingWorkPolicy
@@ -15,8 +17,10 @@ import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -28,77 +32,97 @@ import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import wiki.hubu.rocwol.MainActivity
 import wiki.hubu.rocwol.R
+import wiki.hubu.rocwol.data.AppMigration
 import wiki.hubu.rocwol.data.ManagementAuthorization
+import wiki.hubu.rocwol.data.Origins
+import wiki.hubu.rocwol.data.ServerProfiles
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 class AuthorizationReminders private constructor(context: Context) {
     private val app = context.applicationContext
-    private val preferences = app.getSharedPreferences("authorization_reminders", Context.MODE_PRIVATE)
+    private val preferences = app.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
     private val notifications = requireNotNull(app.getSystemService(NotificationManager::class.java))
     private val work by lazy { WorkManager.getInstance(app) }
-    private val lock = Mutex()
     private val mutableEnabled = MutableStateFlow(preferences.getBoolean("enabled", false))
     val enabled: StateFlow<Boolean> = mutableEnabled.asStateFlow()
 
     init {
         ensureChannel()
-        // Repair a process exit between committing the snapshot and enqueueing its persisted work.
+        // Do not repair partially migrated snapshots or enter the barrier while holding storageLock.
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
-            lock.withLock { reconcile(readSnapshot()) }
+            try {
+                AppMigration.ensure(app)
+                storageLock.withLock {
+                    mutableEnabled.value = preferences.getBoolean("enabled", false)
+                    if (!mutableEnabled.value) clearAllDeliveryLocked()
+                    else reconcileAllLocked()
+                }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                // Startup's migration barrier reports the error; leave the source available for retry.
+            }
         }
     }
 
     suspend fun setEnabled(value: Boolean) = withContext(Dispatchers.IO) {
-        lock.withLock {
+        AppMigration.ensure(app)
+        storageLock.withLock {
             check(preferences.edit().putBoolean("enabled", value).commit())
             mutableEnabled.value = value
-            reconcile(readSnapshot())
+            if (!value) clearAllDeliveryLocked()
+            else reconcileAllLocked()
         }
     }
 
     /** Unknown/offline or pending changes never establish that a confirmed grant was revoked. */
     suspend fun update(
+        profileId: String,
         grant: ManagementAuthorization?,
         known: Boolean,
         pending: Boolean,
         replace: Boolean = false
     ) = withContext(Dispatchers.IO) {
-        lock.withLock {
-            val previous = readSnapshot()
+        AppMigration.ensure(app)
+        storageLock.withLock {
+            if (!usableProfile(profileId)) return@withLock
+            val previous = readSnapshot(preferences, profileId)
             if (grant == null) {
-                if (known && !pending && previous != null) clearLocked()
+                if (ReminderPolicy.mayClear(known, pending)) clearLocked(profileId)
                 return@withLock
             }
-            // Unconfirmed refreshes cannot replace a newer snapshot, even with stale cached data.
-            if (!known && previous != null) {
-                return@withLock
-            }
+            // An unconfirmed refresh cannot replace a remembered grant with stale cached data.
+            if (!known && previous != null) return@withLock
             val expiry = if (grant.isPermanent) null else grant.expiresAt.toEpochMilli()
             val sameGrant = previous != null && previous.origin == grant.origin &&
                 previous.sessionMinutes == grant.sessionMinutes &&
                 previous.allDevices == grant.allowAllDevices && previous.expiresAt == expiry
             if (sameGrant && !replace) {
+                reconcile(profileId, previous)
                 return@withLock
             }
             val now = System.currentTimeMillis()
             val snapshot = ReminderSnapshot(
+                profileId = profileId,
                 generation = UUID.randomUUID().toString(),
-                origin = grant.origin,
+                origin = Origins.checked(grant.origin),
                 sessionMinutes = grant.sessionMinutes,
                 allDevices = grant.allowAllDevices,
                 expiresAt = expiry,
                 remindAt = ReminderPolicy.remindAt(now, grant.allowAllDevices, expiry)
             )
-            saveSnapshot(snapshot)
-            notifications.cancel(NOTIFICATION_ID)
-            work.cancelAllWorkByTag(WORK_NAME).result.get()
-            reconcile(snapshot)
+            // Persist first, so a process exit can repair this exact profile/generation.
+            saveSnapshot(preferences, snapshot)
+            cancelDeliveryLocked(profileId)
+            reconcile(profileId, snapshot)
         }
     }
 
-    /** Use only for confirmed revocation or local identity removal, not network failures. */
-    suspend fun clear() = withContext(Dispatchers.IO) { lock.withLock { clearLocked() } }
+    /** Confirmed revocation or local identity removal only; never a network failure. */
+    suspend fun clear(profileId: String) = withContext(Dispatchers.IO) {
+        AppMigration.ensure(app)
+        storageLock.withLock { clearLocked(profileId) }
+    }
 
     enum class NotificationAvailability { AVAILABLE, PERMISSION_REQUIRED, APP_BLOCKED, CHANNEL_BLOCKED }
 
@@ -114,15 +138,22 @@ class AuthorizationReminders private constructor(context: Context) {
         return NotificationAvailability.AVAILABLE
     }
 
-    internal suspend fun deliver(generation: String) = withContext(Dispatchers.IO) {
-        lock.withLock {
-            val snapshot = readSnapshot() ?: return@withLock
-            if (!snapshot.mayNotify(generation, preferences.getBoolean("enabled", false), System.currentTimeMillis())) {
+    internal suspend fun deliver(profileId: String, generation: String) = withContext(Dispatchers.IO) {
+        AppMigration.ensure(app)
+        storageLock.withLock {
+            if (!usableProfile(profileId)) {
+                cancelDeliveryLocked(profileId)
+                return@withLock
+            }
+            val snapshot = readSnapshot(preferences, profileId) ?: return@withLock
+            if (!snapshot.mayNotify(profileId, generation, preferences.getBoolean("enabled", false), System.currentTimeMillis())) {
                 return@withLock
             }
             if (notificationAvailability() != NotificationAvailability.AVAILABLE) return@withLock
             val intent = Intent(app, MainActivity::class.java)
+                .setData(Uri.parse(ReminderPolicy.managementUri(profileId)))
                 .putExtra(OPEN_MANAGEMENT_EXTRA, true)
+                .putExtra(PROFILE_ID_EXTRA, profileId)
                 .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
             val pendingIntent = PendingIntent.getActivity(
                 app, NOTIFICATION_ID, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
@@ -148,45 +179,66 @@ class AuthorizationReminders private constructor(context: Context) {
                 .setTimeoutAfter(snapshot.expiresAt?.let { (it - System.currentTimeMillis()).coerceAtLeast(1) } ?: 0)
                 .build()
             // Commit before posting: an interrupted worker cannot produce a duplicate alert.
-            saveSnapshot(snapshot.copy(notified = true))
+            saveSnapshot(preferences, snapshot.copy(notified = true))
             try {
-                notifications.notify(NOTIFICATION_ID, notification)
+                notifications.notify(profileId, NOTIFICATION_ID, notification)
             } catch (_: SecurityException) {
-                // Permission can be revoked between the check and posting. No retry loop.
-                saveSnapshot(snapshot)
+                // Permission can be revoked between checking and posting. No retry loop.
+                saveSnapshot(preferences, snapshot)
             }
         }
     }
 
-    private fun clearLocked() {
-        check(preferences.edit().remove("snapshot").commit())
-        notifications.cancel(NOTIFICATION_ID)
-        work.cancelAllWorkByTag(WORK_NAME).result.get()
+    private fun usableProfile(profileId: String): Boolean =
+        ServerProfiles.get(app).get(profileId)?.let { it.removalMode == null } == true
+
+    private fun clearLocked(profileId: String) {
+        check(preferences.edit().remove(ReminderPolicy.snapshotKey(profileId)).commit())
+        cancelDeliveryLocked(profileId)
     }
 
-    private fun reconcile(snapshot: ReminderSnapshot?) {
+    private fun cancelDeliveryLocked(profileId: String) {
+        notifications.cancel(profileId, NOTIFICATION_ID)
+        work.cancelAllWorkByTag(ReminderPolicy.workTag(profileId)).result.get()
+    }
+
+    /** Global off is the only ordinary operation that cancels every profile's delivery. */
+    private fun clearAllDeliveryLocked() {
+        work.cancelAllWorkByTag(ReminderPolicy.ALL_WORK_TAG).result.get()
+        work.cancelAllWorkByTag(ReminderPolicy.LEGACY_WORK_TAG).result.get()
+        snapshotProfileIds(preferences).forEach { notifications.cancel(it, NOTIFICATION_ID) }
+        notifications.activeNotifications.filter { it.notification.channelId == CHANNEL_ID }
+            .forEach { notifications.cancel(it.tag, it.id) }
+        notifications.cancel(NOTIFICATION_ID)
+    }
+
+    private fun reconcileAllLocked() {
+        // A process can exit after snapshot removal but before cancellation. Include profiles
+        // without snapshots and orphaned tagged notifications so startup finishes that cleanup.
+        val profileIds = snapshotProfileIds(preferences) +
+            ServerProfiles.get(app).profiles.value.map { it.profileId } +
+            notifications.activeNotifications
+                .filter { it.notification.channelId == CHANNEL_ID }
+                .mapNotNull { it.tag }
+        profileIds.distinct().forEach { profileId ->
+            reconcile(profileId, readSnapshot(preferences, profileId))
+        }
+    }
+
+    private fun reconcile(profileId: String, snapshot: ReminderSnapshot?) {
         val now = System.currentTimeMillis()
-        if (!preferences.getBoolean("enabled", false) || snapshot == null || snapshot.notified ||
-            snapshot.remindAt == null || (snapshot.expiresAt != null && now >= snapshot.expiresAt)
+        val enabled = preferences.getBoolean("enabled", false)
+        if (!usableProfile(profileId) || snapshot == null || !enabled ||
+            (snapshot.expiresAt != null && now >= snapshot.expiresAt)
         ) {
-            work.cancelAllWorkByTag(WORK_NAME).result.get()
-            if (!preferences.getBoolean("enabled", false) || snapshot == null ||
-                (snapshot.expiresAt != null && now >= snapshot.expiresAt)
-            ) notifications.cancel(NOTIFICATION_ID)
+            cancelDeliveryLocked(profileId)
             return
         }
-        if (notificationAvailability() != NotificationAvailability.AVAILABLE) {
-            work.cancelAllWorkByTag(WORK_NAME).result.get()
+        if (!snapshot.needsWork(enabled, now) || notificationAvailability() != NotificationAvailability.AVAILABLE) {
+            work.cancelAllWorkByTag(ReminderPolicy.workTag(profileId)).result.get()
             return
         }
-        val request = OneTimeWorkRequestBuilder<AuthorizationReminderWorker>()
-            .setInputData(workDataOf(GENERATION_KEY to snapshot.generation))
-            .addTag(WORK_NAME)
-            .setInitialDelay((snapshot.remindAt - now).coerceAtLeast(0), TimeUnit.MILLISECONDS)
-            .build()
-        // A previous generation cannot occupy the new grant's slot after a process exit.
-        // KEEP retains this generation's persisted absolute deadline on ordinary restarts.
-        work.enqueueUniqueWork("$WORK_NAME:${snapshot.generation}", ExistingWorkPolicy.KEEP, request).result.get()
+        enqueue(work, snapshot, now)
     }
 
     private fun ensureChannel() {
@@ -198,10 +250,71 @@ class AuthorizationReminders private constructor(context: Context) {
         )
     }
 
-    private fun readSnapshot(): ReminderSnapshot? = try {
-        preferences.getString("snapshot", null)?.let { value ->
+    companion object {
+        const val CHANNEL_ID = "authorization_reminders"
+        const val OPEN_MANAGEMENT_EXTRA = "open_management"
+        const val PROFILE_ID_EXTRA = "profile_id"
+        internal const val GENERATION_KEY = "generation"
+        private const val PREFERENCES_NAME = "authorization_reminders"
+        private const val LEGACY_MIGRATED_KEY = "legacy_snapshot_migrated"
+        private const val NOTIFICATION_ID = 4101
+        private val storageLock = Mutex()
+        @Volatile private var instance: AuthorizationReminders? = null
+
+        fun get(context: Context): AuthorizationReminders = instance ?: synchronized(this) {
+            instance ?: AuthorizationReminders(context).also { instance = it }
+        }
+
+        /** Raw migration entry: called inside AppMigration, never calls its barrier or a business singleton. */
+        suspend fun migrateLegacy(context: Context) = withContext(Dispatchers.IO + NonCancellable) {
+            storageLock.withLock {
+                val app = context.applicationContext
+                val preferences = app.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
+                val migrated = preferences.getBoolean(LEGACY_MIGRATED_KEY, false)
+                val legacy = preferences.getString("snapshot", null)
+                if (migrated && legacy == null) return@withLock
+                val work = WorkManager.getInstance(app)
+                if (!migrated && legacy != null) {
+                    val profileId = ReminderPolicy.LEGACY_PROFILE_ID
+                    // Never overwrite a scoped snapshot already written by a prior migration attempt.
+                    val snapshot = readSnapshot(preferences, profileId) ?: decodeSnapshot(profileId, legacy).copy(
+                        origin = Origins.checked(JSONObject(legacy).getString("origin"))
+                    ).also { saveSnapshot(preferences, it) }
+                    val now = System.currentTimeMillis()
+                    if (snapshot.needsWork(preferences.getBoolean("enabled", false), now)) {
+                        // Wait for persisted enqueue before committing completion or cancelling the old worker.
+                        enqueue(work, snapshot, now)
+                    }
+                }
+                check(preferences.edit().putBoolean(LEGACY_MIGRATED_KEY, true).commit())
+                work.cancelAllWorkByTag(ReminderPolicy.LEGACY_WORK_TAG).result.get()
+                requireNotNull(app.getSystemService(NotificationManager::class.java)).cancel(NOTIFICATION_ID)
+                check(preferences.edit().remove("snapshot").commit())
+            }
+        }
+
+        /** Raw removal recovery for AppMigration; public clear waits for the barrier instead. */
+        suspend fun clearForMigration(context: Context, profileId: String) = withContext(Dispatchers.IO + NonCancellable) {
+            storageLock.withLock {
+                val app = context.applicationContext
+                val preferences = app.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
+                check(preferences.edit().remove(ReminderPolicy.snapshotKey(profileId)).commit())
+                requireNotNull(app.getSystemService(NotificationManager::class.java)).cancel(profileId, NOTIFICATION_ID)
+                WorkManager.getInstance(app).cancelAllWorkByTag(ReminderPolicy.workTag(profileId)).result.get()
+            }
+        }
+
+        private fun snapshotProfileIds(preferences: SharedPreferences): List<String> =
+            preferences.all.keys.filter { it.startsWith(ReminderPolicy.SNAPSHOT_PREFIX) }
+                .map { it.removePrefix(ReminderPolicy.SNAPSHOT_PREFIX) }
+
+        private fun readSnapshot(preferences: SharedPreferences, profileId: String): ReminderSnapshot? =
+            preferences.getString(ReminderPolicy.snapshotKey(profileId), null)?.let { decodeSnapshot(profileId, it) }
+
+        private fun decodeSnapshot(profileId: String, value: String): ReminderSnapshot {
             val json = JSONObject(value)
-            ReminderSnapshot(
+            return ReminderSnapshot(
+                profileId = profileId,
                 generation = json.getString("generation"),
                 origin = json.getString("origin"),
                 sessionMinutes = json.getInt("sessionMinutes"),
@@ -211,38 +324,45 @@ class AuthorizationReminders private constructor(context: Context) {
                 notified = json.getBoolean("notified")
             )
         }
-    } catch (_: Exception) { null }
 
-    private fun saveSnapshot(snapshot: ReminderSnapshot) {
-        val json = JSONObject()
-            .put("generation", snapshot.generation)
-            .put("origin", snapshot.origin)
-            .put("sessionMinutes", snapshot.sessionMinutes)
-            .put("allDevices", snapshot.allDevices)
-            .put("expiresAt", snapshot.expiresAt ?: JSONObject.NULL)
-            .put("remindAt", snapshot.remindAt ?: JSONObject.NULL)
-            .put("notified", snapshot.notified)
-        check(preferences.edit().putString("snapshot", json.toString()).commit())
-    }
+        private fun saveSnapshot(preferences: SharedPreferences, snapshot: ReminderSnapshot) {
+            val json = JSONObject()
+                .put("generation", snapshot.generation)
+                .put("origin", snapshot.origin)
+                .put("sessionMinutes", snapshot.sessionMinutes)
+                .put("allDevices", snapshot.allDevices)
+                .put("expiresAt", snapshot.expiresAt ?: JSONObject.NULL)
+                .put("remindAt", snapshot.remindAt ?: JSONObject.NULL)
+                .put("notified", snapshot.notified)
+            check(preferences.edit().putString(ReminderPolicy.snapshotKey(snapshot.profileId), json.toString()).commit())
+        }
 
-    companion object {
-        const val CHANNEL_ID = "authorization_reminders"
-        const val OPEN_MANAGEMENT_EXTRA = "open_management"
-        internal const val GENERATION_KEY = "generation"
-        private const val WORK_NAME = "authorization-reminder"
-        private const val NOTIFICATION_ID = 4101
-        @Volatile private var instance: AuthorizationReminders? = null
-
-        fun get(context: Context): AuthorizationReminders = instance ?: synchronized(this) {
-            instance ?: AuthorizationReminders(context).also { instance = it }
+        private fun enqueue(work: WorkManager, snapshot: ReminderSnapshot, now: Long) {
+            val request = OneTimeWorkRequestBuilder<AuthorizationReminderWorker>()
+                .setInputData(workDataOf(PROFILE_ID_EXTRA to snapshot.profileId, GENERATION_KEY to snapshot.generation))
+                .addTag(ReminderPolicy.workTag(snapshot.profileId))
+                .addTag(ReminderPolicy.ALL_WORK_TAG)
+                .setInitialDelay((requireNotNull(snapshot.remindAt) - now).coerceAtLeast(0), TimeUnit.MILLISECONDS)
+                .build()
+            // KEEP preserves this generation's absolute deadline on ordinary restarts.
+            work.enqueueUniqueWork(ReminderPolicy.workName(snapshot.profileId, snapshot.generation), ExistingWorkPolicy.KEEP, request)
+                .result.get()
         }
     }
 }
 
 class AuthorizationReminderWorker(context: Context, parameters: WorkerParameters) : CoroutineWorker(context, parameters) {
     override suspend fun doWork(): Result {
-        val generation = inputData.getString(AuthorizationReminders.GENERATION_KEY) ?: return Result.success()
-        AuthorizationReminders.get(applicationContext).deliver(generation)
-        return Result.success()
+        return try {
+            // Even a legacy worker must finish the shared migration before reading its old input.
+            AppMigration.ensure(applicationContext)
+            val profileId = inputData.getString(AuthorizationReminders.PROFILE_ID_EXTRA) ?: return Result.success()
+            val generation = inputData.getString(AuthorizationReminders.GENERATION_KEY) ?: return Result.success()
+            AuthorizationReminders.get(applicationContext).deliver(profileId, generation)
+            Result.success()
+        } catch (error: Exception) {
+            if (error is CancellationException) throw error
+            Result.failure()
+        }
     }
 }

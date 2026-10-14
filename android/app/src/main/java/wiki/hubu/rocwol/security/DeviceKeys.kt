@@ -24,16 +24,15 @@ class AuthenticationCancelled : Exception()
 class AuthenticationUnavailable(cause: Throwable? = null) : Exception(cause)
 class IdentityLost : Exception()
 
-class DeviceKeys {
+class DeviceKeys(val wakeAlias: String, val manageAlias: String) {
     companion object {
-        const val WAKE = "roc_wol_wake_v1"
-        const val MANAGE = "roc_wol_manage_v1"
         fun encode(bytes: ByteArray): String = Base64.encodeToString(bytes, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
         fun hash(bytes: ByteArray): String = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it.toInt() and 255) }
     }
     private fun store(): KeyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-    fun hasIdentity(): Boolean = store().let { it.containsAlias(WAKE) && it.containsAlias(MANAGE) }
-    fun removeLocalKeys() { store().apply { deleteEntry(WAKE); deleteEntry(MANAGE) } }
+    fun hasIdentity(): Boolean = store().let { it.containsAlias(wakeAlias) && it.containsAlias(manageAlias) }
+    fun hasAnyIdentity(): Boolean = store().let { it.containsAlias(wakeAlias) || it.containsAlias(manageAlias) }
+    fun removeLocalKeys() { store().apply { deleteEntry(wakeAlias); deleteEntry(manageAlias) } }
     suspend fun preparePairing(activity: Activity) = withContext(Dispatchers.IO) {
         val keyguard = activity.getSystemService(KeyguardManager::class.java)
         val biometric = activity.getSystemService(BiometricManager::class.java)
@@ -43,8 +42,8 @@ class DeviceKeys {
         // Only unpaired devices invoke this; never silently replace an established identity.
         if (!hasIdentity()) {
             removeLocalKeys()
-            generate(WAKE, false)
-            generate(MANAGE, true)
+            generate(wakeAlias, false)
+            generate(manageAlias, true)
         }
     }
     private fun generate(alias: String, authenticated: Boolean) {
@@ -58,6 +57,7 @@ class DeviceKeys {
         KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore").apply { initialize(spec.build()) }.generateKeyPair()
     }
     suspend fun publicKey(alias: String): ByteArray = withContext(Dispatchers.IO) {
+        require(alias == wakeAlias || alias == manageAlias)
         store().getCertificate(alias)?.publicKey?.encoded ?: throw IdentityLost()
     }
     private fun signer(alias: String): Signature {
@@ -65,13 +65,13 @@ class DeviceKeys {
         return Signature.getInstance("SHA256withECDSA").apply { initSign(key) }
     }
     suspend fun signWake(message: String): String = withContext(Dispatchers.IO) {
-        val signature = signer(WAKE)
+        val signature = signer(wakeAlias)
         signature.update(message.toByteArray(Charsets.UTF_8))
         encode(signature.sign())
     }
     suspend fun signManagement(activity: Activity, message: String, sessionMinutes: Int?, allowAllDevices: Boolean, purpose: String? = null): String {
         val signature = withContext(Dispatchers.IO) {
-            try { signer(MANAGE) }
+            try { signer(manageAlias) }
             catch (e: java.security.GeneralSecurityException) { throw AuthenticationUnavailable(e) }
         }
         val authenticated = withContext(Dispatchers.Main.immediate) {

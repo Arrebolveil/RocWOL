@@ -17,9 +17,12 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+
+	"hubu.wiki/roc-wol/internal/protocol"
 )
 
-const apiPrefix = "/_roc-agent/v1/"
+const apiPrefix = "/_roc-agent/v2/"
 const jsonLimit = 16 * 1024
 const uploadLimit = 128 * 1024 * 1024
 
@@ -41,26 +44,38 @@ type Status struct {
 }
 
 type Agent struct {
-	config    Config
-	ledger    *ledger
-	runner    Runner
-	tlsConfig *tls.Config
-	proxy     *httputil.ReverseProxy
-	transport *http.Transport
-	ctx       context.Context
-	cancel    context.CancelFunc
-	lifeMu    sync.Mutex
-	closed    bool
-	requests  sync.WaitGroup
-	closeOnce sync.Once
-	closeErr  error
+	config     Config
+	ledger     *ledger
+	runner     Runner
+	tlsConfig  *tls.Config
+	proxy      *httputil.ReverseProxy
+	transport  *http.Transport
+	ctx        context.Context
+	cancel     context.CancelFunc
+	lifeMu     sync.Mutex
+	closed     bool
+	requests   sync.WaitGroup
+	closeOnce  sync.Once
+	closeErr   error
+	targets    map[string]*targetState
+	targetList protocol.TargetList
+}
+
+type targetState struct {
+	target    Target
 	probeGate chan struct{}
 	status    Status
 }
 
 func New(c Config, runner Runner) (*Agent, error) {
+	c = c.normalized()
 	if err := c.Validate(); err != nil {
 		return nil, err
+	}
+	if runner == nil {
+		if err := c.validateRuntime(); err != nil {
+			return nil, err
+		}
 	}
 	tlsConfig, err := loadTLS(c)
 	if err != nil {
@@ -74,8 +89,17 @@ func New(c Config, runner Runner) (*Agent, error) {
 		runner = commandRunner{}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	a := &Agent{config: c, ledger: l, runner: runner, tlsConfig: tlsConfig, ctx: ctx, cancel: cancel, probeGate: make(chan struct{}, 1)}
-	origin, _ := url.Parse(c.LuCIOrigin)
+	// Copy the configured targets into a bounded, immutable index.
+	a := &Agent{config: c, ledger: l, runner: runner, tlsConfig: tlsConfig, ctx: ctx, cancel: cancel, targets: make(map[string]*targetState, len(c.Targets))}
+	a.targetList = protocol.TargetList{Targets: make([]protocol.TargetInfo, 0, len(c.Targets)), ManagementEnabled: c.LuCIOrigin != ""}
+	for _, target := range c.Targets {
+		a.targets[target.ID] = &targetState{target: target, probeGate: make(chan struct{}, 1)}
+		a.targetList.Targets = append(a.targetList.Targets, protocol.TargetInfo{TargetID: target.ID, Name: target.Name, MAC: target.MAC, IP: target.IP})
+	}
+	if c.LuCIOrigin == "" {
+		return a, nil
+	}
+	origin, _ := luciOrigin(c.LuCIOrigin)
 	a.transport = &http.Transport{
 		Proxy:                 nil,
 		DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -101,6 +125,16 @@ func New(c Config, runner Runner) (*Agent, error) {
 		},
 		ModifyResponse: func(resp *http.Response) error {
 			resp.Header.Set("Cache-Control", "no-store")
+			if location := resp.Header.Get("Location"); location != "" {
+				if len(resp.Header.Values("Location")) != 1 {
+					return errors.New("ambiguous management redirect")
+				}
+				safe, err := safeLuCILocation(location, origin)
+				if err != nil {
+					return err
+				}
+				resp.Header.Set("Location", safe)
+			}
 			if resp.StatusCode == http.StatusSwitchingProtocols {
 				body, ok := resp.Body.(io.ReadWriteCloser)
 				if !ok {
@@ -199,7 +233,9 @@ func (a *Agent) Close() error {
 		a.cancel()
 		a.lifeMu.Unlock()
 		a.requests.Wait()
-		a.transport.CloseIdleConnections()
+		if a.transport != nil {
+			a.transport.CloseIdleConnections()
+		}
 		a.closeErr = a.ledger.db.Close()
 	})
 	return a.closeErr
@@ -232,19 +268,35 @@ func (a *Agent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid_request", "CONNECT is not supported.", "")
 		return
 	}
+	if strings.HasPrefix(r.URL.Path, "/_roc-agent/v1/") || r.URL.Path == "/_roc-agent/v1" {
+		writeError(w, http.StatusUpgradeRequired, "protocol_upgrade_required", "Agent protocol v2 is required.", "")
+		return
+	}
 	if strings.HasPrefix(r.URL.Path, "/_roc-agent/") || r.URL.Path == "/_roc-agent" {
-		fresh := r.URL.Path == apiPrefix+"status" && r.Method == http.MethodGet && r.URL.RawQuery == "fresh=1"
+		targetID, statusRoute := statusTarget(r.URL.Path)
+		fresh := statusRoute && r.Method == http.MethodGet && r.URL.RawQuery == "fresh=1"
 		if r.URL.RawQuery != "" && !fresh {
 			writeError(w, 400, "invalid_request", "Unsupported agent API query parameters.", "")
 			return
 		}
 		switch {
+		case r.URL.Path == apiPrefix+"targets" && r.Method == http.MethodGet:
+			writeJSON(w, 200, a.targetList)
 		case r.URL.Path == apiPrefix+"wake" && r.Method == http.MethodPost:
 			a.wake(w, r)
 		case strings.HasPrefix(r.URL.Path, apiPrefix+"wake/") && r.Method == http.MethodGet:
 			a.query(w, r, strings.TrimPrefix(r.URL.Path, apiPrefix+"wake/"))
-		case r.URL.Path == apiPrefix+"status" && r.Method == http.MethodGet:
-			status, err := a.probe(r.Context(), fresh)
+		case statusRoute && r.Method == http.MethodGet:
+			if !protocol.ValidTargetID(targetID) {
+				writeError(w, 400, "invalid_request", "Invalid target ID.", "")
+				return
+			}
+			target := a.targets[targetID]
+			if target == nil {
+				writeError(w, 404, "target_not_found", "Target not found.", "")
+				return
+			}
+			status, err := a.probe(r.Context(), target, fresh)
 			if err != nil {
 				writeError(w, 503, "upstream_unavailable", "Status probe canceled.", "")
 				return
@@ -255,12 +307,68 @@ func (a *Agent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	if a.proxy == nil {
+		writeError(w, 403, "management_disabled", "Router management is disabled.", "")
+		return
+	}
 	if r.ContentLength > uploadLimit {
 		writeError(w, 413, "invalid_request", "Upload exceeds the allowed size.", "")
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, uploadLimit)
 	a.proxy.ServeHTTP(w, r)
+}
+
+func statusTarget(path string) (string, bool) {
+	if !strings.HasPrefix(path, apiPrefix+"targets/") || !strings.HasSuffix(path, "/status") {
+		return "", false
+	}
+	id := strings.TrimSuffix(strings.TrimPrefix(path, apiPrefix+"targets/"), "/status")
+	return id, !strings.Contains(id, "/")
+}
+
+// Only same-origin absolute redirects may be converted to relative references.
+// Network-path references and ambiguous escaped separators are never forwarded.
+func safeLuCILocation(value string, origin *url.URL) (string, error) {
+	invalid := errors.New("unsafe management redirect")
+	for _, ch := range value {
+		if ch <= 0x20 || unicode.IsControl(ch) {
+			return "", invalid
+		}
+	}
+	lower := strings.ToLower(value)
+	if strings.Contains(value, "\\") || strings.Contains(lower, "%2f") || strings.Contains(lower, "%5c") || strings.HasPrefix(value, "//") {
+		return "", invalid
+	}
+	decoded, err := url.PathUnescape(value)
+	if err != nil {
+		return "", invalid
+	}
+	for _, ch := range decoded {
+		if unicode.IsControl(ch) || ch == '\\' {
+			return "", invalid
+		}
+	}
+	u, err := url.Parse(value)
+	if err != nil || u.User != nil || u.Opaque != "" {
+		return "", invalid
+	}
+	if u.IsAbs() {
+		candidate, err := luciOrigin(u.Scheme + "://" + u.Host)
+		if err != nil || candidate.Host != origin.Host || candidate.Scheme != origin.Scheme {
+			return "", invalid
+		}
+		u.Scheme, u.Host = "", ""
+		if u.Path == "" {
+			u.Path = "/"
+		}
+	} else if u.Host != "" {
+		return "", invalid
+	}
+	if strings.HasPrefix(u.Path, "//") {
+		return "", invalid
+	}
+	return u.String(), nil
 }
 
 func validPath(r *http.Request) bool {
@@ -303,14 +411,36 @@ func (a *Agent) wake(w http.ResponseWriter, r *http.Request) {
 		TargetID  string `json:"targetId"`
 	}
 	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, jsonLimit))
-	if err != nil || strictJSON(data, &req) != nil || !validID(req.RequestID) || req.TargetID != "desktop" {
+	if err != nil || strictJSON(data, &req) != nil || !validID(req.RequestID) || !protocol.ValidTargetID(req.TargetID) {
 		writeError(w, 400, "invalid_request", "Invalid wake request.", "")
 		return
 	}
-	result, fresh, err := a.ledger.reserve(req.RequestID, time.Now().UTC())
+	// Existing requests are bound before consulting today's deployment whitelist:
+	// deleting a target must not release deduplication or erase queryable history.
+	result, err := a.ledger.lookup(req.RequestID, time.Now().UTC())
+	if err == nil {
+		if result.TargetID != req.TargetID {
+			writeJSON(w, 409, WakeResult{RequestID: req.RequestID, TargetID: req.TargetID, Result: "failed", Code: "request_target_mismatch"})
+			return
+		}
+		writeJSON(w, wakeHTTPStatus(result), result)
+		return
+	}
+	if !errors.Is(err, errNotFound) {
+		writeError(w, 503, "upstream_unavailable", "Cannot read wake history.", req.RequestID)
+		return
+	}
+	target := a.targets[req.TargetID]
+	if target == nil {
+		writeJSON(w, 404, WakeResult{RequestID: req.RequestID, TargetID: req.TargetID, Result: "failed", Code: "target_not_found"})
+		return
+	}
+	result, fresh, err := a.ledger.reserve(req.RequestID, req.TargetID, time.Now().UTC())
 	if err != nil {
 		var limit rateError
 		switch {
+		case errors.Is(err, errTargetMismatch):
+			writeJSON(w, 409, WakeResult{RequestID: req.RequestID, TargetID: req.TargetID, Result: "failed", Code: "request_target_mismatch"})
 		case errors.As(err, &limit):
 			w.Header().Set("Retry-After", strconv.Itoa(limit.seconds))
 			writeError(w, 429, "rate_limited", "Wait before another wake request.", req.RequestID)
@@ -326,7 +456,12 @@ func (a *Agent) wake(w http.ResponseWriter, r *http.Request) {
 		// Acceptance is durable. Client disconnects do not cancel or retry the
 		// command; agent shutdown and the three-second bound still cancel it.
 		ctx, cancel := context.WithTimeout(a.ctx, 3*time.Second)
-		err := a.runner.Run(ctx, "/usr/bin/etherwake", "-i", "br-lan", "-b", "B0:25:AA:83:C6:EF")
+		var err error
+		if target.target.Broadcast {
+			err = a.runner.Run(ctx, a.config.EtherwakePath, "-i", target.target.Interface, "-b", target.target.MAC)
+		} else {
+			err = a.runner.Run(ctx, a.config.EtherwakePath, "-i", target.target.Interface, target.target.MAC)
+		}
 		ctxErr := ctx.Err()
 		cancel()
 		result.Result, result.Code = commandOutcome(err, ctxErr)
@@ -338,14 +473,17 @@ func (a *Agent) wake(w http.ResponseWriter, r *http.Request) {
 			result.Result, result.Code, result.SentAt = "unknown", "outcome_unknown", nil
 		}
 	}
-	status := http.StatusAccepted
+	writeJSON(w, wakeHTTPStatus(result), result)
+}
+
+func wakeHTTPStatus(result WakeResult) int {
 	if result.Result == "failed" {
-		status = http.StatusBadGateway
+		return http.StatusBadGateway
 	}
 	if result.Result == "unknown" {
-		status = http.StatusGatewayTimeout
+		return http.StatusGatewayTimeout
 	}
-	writeJSON(w, status, result)
+	return http.StatusAccepted
 }
 
 func commandOutcome(err, ctxErr error) (string, string) {
@@ -379,10 +517,10 @@ func (a *Agent) query(w http.ResponseWriter, r *http.Request, id string) {
 	writeJSON(w, 200, result)
 }
 
-func (a *Agent) probe(caller context.Context, fresh bool) (Status, error) {
+func (a *Agent) probe(caller context.Context, target *targetState, fresh bool) (Status, error) {
 	select {
-	case a.probeGate <- struct{}{}:
-		defer func() { <-a.probeGate }()
+	case target.probeGate <- struct{}{}:
+		defer func() { <-target.probeGate }()
 	case <-caller.Done():
 		return Status{}, caller.Err()
 	}
@@ -393,12 +531,12 @@ func (a *Agent) probe(caller context.Context, fresh bool) (Status, error) {
 	if err := a.ctx.Err(); err != nil {
 		return Status{}, err
 	}
-	if !fresh && !a.status.CheckedAt.IsZero() && time.Since(a.status.CheckedAt) < 3*time.Second {
-		return a.status, nil
+	if !fresh && !target.status.CheckedAt.IsZero() && time.Since(target.status.CheckedAt) < 3*time.Second {
+		return target.status, nil
 	}
 	ctx, cancel := context.WithTimeout(caller, 2*time.Second)
 	defer cancel()
-	err := a.runner.Run(ctx, a.config.PingPath, "-c", "1", "-W", "1", "192.168.2.100")
+	err := a.runner.Run(ctx, a.config.PingPath, "-c", "1", "-W", "1", target.target.IP)
 	if err := caller.Err(); err != nil {
 		return Status{}, err
 	}
@@ -411,8 +549,8 @@ func (a *Agent) probe(caller context.Context, fresh bool) (Status, error) {
 			state = "unreachable"
 		}
 	}
-	a.status = Status{TargetID: "desktop", Reachability: state, CheckedAt: time.Now().UTC()}
-	return a.status, nil
+	target.status = Status{TargetID: target.target.ID, Reachability: state, CheckedAt: time.Now().UTC()}
+	return target.status, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

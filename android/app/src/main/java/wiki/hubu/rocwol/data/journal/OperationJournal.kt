@@ -22,6 +22,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import wiki.hubu.rocwol.data.AppMigration
 
 /**
  * Private, no-backup local log. record() confirms queue acceptance only; recordConfirmed()
@@ -42,8 +44,10 @@ class OperationJournal private constructor(context: Context) {
         scope.launch {
             try {
                 val db = database()
-                db.events().expire(System.currentTimeMillis() - RETENTION_MS)
-                db.events().trim()
+                db.withTransaction {
+                    db.events().expire(System.currentTimeMillis() - RETENTION_MS)
+                    db.events().trim()
+                }
                 cleanupExports()
             } catch (_: Exception) {
                 storageFailure()
@@ -103,7 +107,7 @@ class OperationJournal private constructor(context: Context) {
             records.collectLatest { current ->
                 val oldest = current.minOfOrNull { it.timestamp.toEpochMilli() } ?: return@collectLatest
                 delay((oldest + RETENTION_MS + 1 - System.currentTimeMillis()).coerceAtLeast(1))
-                commands.send(Command.Prune)
+                while (!commands.trySend(Command.Prune).isSuccess) delay(100)
             }
         }
     }
@@ -120,41 +124,40 @@ class OperationJournal private constructor(context: Context) {
     /** Queue-ordered barrier: earlier accepted events cannot reappear after clearing. */
     suspend fun clear(): Boolean {
         val reply = CompletableDeferred<Boolean>()
-        commands.send(Command.Clear(reply))
+        if (!enqueueControl(Command.Clear(reply))) return false
         return reply.await()
     }
 
     /** Returns a grant-read-only Sharesheet intent, or null on a safe export failure. */
     suspend fun exportShareIntent(): Intent? {
         val reply = CompletableDeferred<Intent?>()
-        commands.send(Command.Export(reply))
+        if (!enqueueControl(Command.Export(reply))) return null
         return reply.await()
     }
 
     private fun submit(event: JournalEvent, reply: CompletableDeferred<Boolean>?): Boolean {
-        if (!event.isSafe()) {
+        if (!event.isSafeToAppend()) {
             mutableHealth.update { it.copy(problem = JournalProblem.INVALID_EVENT, droppedRecords = it.droppedRecords + 1) }
             return false
         }
         mutableHealth.update { it.copy(pendingWrites = it.pendingWrites + 1) }
-        if (commands.trySend(Command.Append(event, System.currentTimeMillis(), reply)).isSuccess) return true
+        if (commands.trySend(Command.Append(event.localOnly(), System.currentTimeMillis(), reply)).isSuccess) return true
         mutableHealth.update { it.copy(problem = JournalProblem.QUEUE_FULL, pendingWrites = (it.pendingWrites - 1).coerceAtLeast(0), droppedRecords = it.droppedRecords + 1) }
         return false
     }
 
+    // Never retain unbounded suspended senders outside the bounded app-wide command queue.
+    private fun enqueueControl(command: Command): Boolean {
+        if (commands.trySend(command).isSuccess) return true
+        mutableHealth.update { it.copy(problem = JournalProblem.QUEUE_FULL) }
+        return false
+    }
+
     // Called exclusively by the IO command consumer; opening the database never blocks the UI.
-    private fun database(): JournalDatabase {
+    private suspend fun database(): JournalDatabase {
+        AppMigration.ensure(context)
         database?.let { return it }
-        val file = File(context.noBackupFilesDir, "operation-journal.db")
-        val db = Room.databaseBuilder(context, JournalDatabase::class.java, file.absolutePath)
-            .build()
-        // Force opening here so a failed open is retryable on the next operation.
-        try {
-            db.openHelper.writableDatabase
-        } catch (failure: Exception) {
-            db.close()
-            throw failure
-        }
+        val db = openRaw(context)
         database = db
         scope.launch {
             try {
@@ -177,16 +180,18 @@ class OperationJournal private constructor(context: Context) {
     private fun export(events: List<JournalRecord>): Intent {
         val directory = File(context.cacheDir, "log-exports")
         check(directory.isDirectory || directory.mkdirs())
-        cleanupExports()
+        cleanupExports(maxFiles = 2)
         val file = File(directory, "operation-log-${UUID.randomUUID()}.txt")
         try {
             file.outputStream().bufferedWriter(Charsets.UTF_8).use { writer ->
                 writer.appendLine("网络唤醒 · 本机操作日志")
                 writer.appendLine("仅含本机保留的最近 7 天、最多 2000 条记录。重复自动检查会合并。")
                 writer.appendLine("已发送不代表电脑已开机；在线状态是探测结果，不证明由本次唤醒导致。")
-                writer.appendLine("不含凭据、设备名称、IP/MAC、请求/响应正文或完整链接。入口和请求 ID 用于排障。")
+                writer.appendLine("不含凭据、服务器/电脑名称、域名、原始标识、IP/MAC 或请求/响应正文。")
+                writer.appendLine("服务器、电脑和线路使用本份导出内稳定的本地别名；请求 ID 和受控错误类别可用于排障。")
                 writer.appendLine()
-                events.forEach { writer.appendLine(it.safeText()); writer.appendLine() }
+                val aliases = JournalAliases()
+                events.forEach { writer.appendLine(it.safeText(aliases)); writer.appendLine() }
             }
             val uri = FileProvider.getUriForFile(context, "wiki.hubu.rocwol.logs", file)
             val send = Intent(Intent.ACTION_SEND).apply {
@@ -204,13 +209,13 @@ class OperationJournal private constructor(context: Context) {
         }
     }
 
-    private fun cleanupExports(deleteAll: Boolean = false) {
+    private fun cleanupExports(deleteAll: Boolean = false, maxFiles: Int = 3) {
         val directory = File(context.cacheDir, "log-exports")
         val files = directory.listFiles()?.filter { it.isFile && it.name.startsWith("operation-log-") && it.extension == "txt" }
             ?.sortedByDescending { it.lastModified() } ?: return
         val cutoff = System.currentTimeMillis() - EXPORT_TTL_MS
         files.forEachIndexed { index, file ->
-            if (deleteAll || index >= 3 || file.lastModified() < cutoff) file.delete()
+            if (deleteAll || index >= maxFiles || file.lastModified() < cutoff) check(file.delete())
         }
     }
 
@@ -226,6 +231,30 @@ class OperationJournal private constructor(context: Context) {
         private const val AGGREGATION_WINDOW_MS = 15 * 60 * 1000L
         private const val EXPORT_TTL_MS = 24 * 60 * 60 * 1000L
         @Volatile private var instance: OperationJournal? = null
+        suspend fun ready(context: Context): OperationJournal {
+            AppMigration.ensure(context)
+            return get(context)
+        }
+
+        /** Migration barrier's raw entry point. Must not call ready/get/ensure here. */
+        suspend fun migrateStorage(context: Context) = withContext(Dispatchers.IO) {
+            openRaw(context.applicationContext).close()
+        }
+
+        private fun openRaw(context: Context): JournalDatabase {
+            val file = File(context.noBackupFilesDir, "operation-journal.db")
+            val db = Room.databaseBuilder(context, JournalDatabase::class.java, file.absolutePath)
+                .addMigrations(JournalDatabase.MIGRATION_1_2)
+                .build()
+            try {
+                db.openHelper.writableDatabase
+            } catch (failure: Exception) {
+                db.close()
+                throw failure
+            }
+            return db
+        }
+
         fun get(context: Context): OperationJournal = instance ?: synchronized(this) {
             instance ?: OperationJournal(context).also { instance = it }
         }

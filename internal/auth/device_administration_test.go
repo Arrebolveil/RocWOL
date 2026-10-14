@@ -10,7 +10,7 @@ import (
 	"hubu.wiki/roc-wol/internal/protocol"
 )
 
-const administrationOrigin = "https://wol.hubu.wiki"
+const administrationOrigin = "https://wol.example"
 
 func administrator(t *testing.T, s *State, k keys) protocol.Credentials {
 	t.Helper()
@@ -83,13 +83,13 @@ func TestDeviceAdministrationSignatureBindingsConsumeAttempt(t *testing.T) {
 			case "nonce":
 				parts[4] = protocol.Random(32)
 			case "signed-origin":
-				parts[5] = "https://roc.hubu.wiki"
+				parts[5] = "https://backup.example"
 			case "signed-action":
 				parts[6] = "list"
 			case "signed-target":
 				parts[7] = owner.DeviceID
 			case "request-origin":
-				requestOrigin = "https://roc.hubu.wiki"
+				requestOrigin = "https://backup.example"
 			case "request-target":
 				requestTarget = owner.DeviceID
 			}

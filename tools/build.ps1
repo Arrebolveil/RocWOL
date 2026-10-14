@@ -1,15 +1,8 @@
 [CmdletBinding()]
-param(
-    [string]$DeploymentConfig = '',
-    [ValidateSet('https://wol.hubu.wiki', 'https://wol-direct.hubu.wiki')]
-    [string]$DirectOrigin = 'https://wol.hubu.wiki',
-    [ValidateSet('https://roc.hubu.wiki')]
-    [string]$FallbackOrigin = 'https://roc.hubu.wiki'
-)
+param()
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $Root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-if (-not $DeploymentConfig) { $DeploymentConfig = Join-Path $Root 'private\deployment.json' }
 $Tools = Join-Path $env:LOCALAPPDATA 'RocWol\tools'
 $Signing = Join-Path $env:LOCALAPPDATA 'RocWol\signing'
 $Dist = Join-Path $Root 'dist'
@@ -52,11 +45,6 @@ function Download-Official {
     }
     Invoke-Native 'node' @($Download, $Url, $Destination, $Algorithm, $Checksum)
 }
-function Random-Password {
-    $bytes = New-Object byte[] 32
-    $generator = [Security.Cryptography.RandomNumberGenerator]::Create()
-    try { $generator.GetBytes($bytes); return [Convert]::ToBase64String($bytes) } finally { $generator.Dispose(); [Array]::Clear($bytes, 0, $bytes.Length) }
-}
 function Set-ProcessEnvironment {
     param([string]$Name, [string]$Value)
     [Environment]::SetEnvironmentVariable($Name, $Value, 'Process')
@@ -68,13 +56,12 @@ $goVersion = (& go version) -join ' '
 if ($LASTEXITCODE -ne 0 -or $goVersion -notmatch '\bgo1\.26\.3\b') { throw 'Go 1.26.3 is required; do not silently change the approved toolchain.' }
 [IO.Directory]::CreateDirectory($Tools) | Out-Null
 [IO.Directory]::CreateDirectory($Dist) | Out-Null
-$deployment = $null
-if (Test-Path -LiteralPath $DeploymentConfig) {
-    $deployment = Get-Content -LiteralPath $DeploymentConfig -Raw | ConvertFrom-Json
-    $DirectOrigin = "https://$($deployment.directHost)"
-    $FallbackOrigin = "https://$($deployment.fallbackHost)"
+$keystore = if ($env:ROCWOL_KEYSTORE) { [IO.Path]::GetFullPath($env:ROCWOL_KEYSTORE) } else { Join-Path $Signing 'roc-wol.p12' }
+$storePasswordFile = if ($env:ROCWOL_STORE_PASSWORD_FILE) { [IO.Path]::GetFullPath($env:ROCWOL_STORE_PASSWORD_FILE) } else { Join-Path $Signing 'store-password.txt' }
+$keyPasswordFile = if ($env:ROCWOL_KEY_PASSWORD_FILE) { [IO.Path]::GetFullPath($env:ROCWOL_KEY_PASSWORD_FILE) } else { Join-Path $Signing 'key-password.txt' }
+foreach ($file in @($keystore, $storePasswordFile, $keyPasswordFile)) {
+    if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw 'Existing official release keystore and both password files are required; signing identities are never generated.' }
 }
-if ($DirectOrigin -notin @('https://wol.hubu.wiki', 'https://wol-direct.hubu.wiki') -or $FallbackOrigin -ne 'https://roc.hubu.wiki') { throw 'Deployment origins are outside the approved whitelist.' }
 
 # Reuse the locally installed project JDK, not global java8path or a changed system JAVA_HOME.
 $JavaHome = $null
@@ -149,26 +136,6 @@ $distributionUrl = $distributionMatch.Groups[1].Value.Trim().Replace('\:', ':')
 if ($distributionUrl -notin @('https://services.gradle.org/distributions/gradle-8.13-bin.zip', 'https://downloads.gradle.org/distributions/gradle-8.13-bin.zip')) { throw 'Android wrapper distribution URL differs from the approved official Gradle8.13 URL.' }
 
 Protect-Directory $Signing
-$keystore = if ($env:ROCWOL_KEYSTORE) { [IO.Path]::GetFullPath($env:ROCWOL_KEYSTORE) } else { Join-Path $Signing 'roc-wol.p12' }
-$storePasswordFile = if ($env:ROCWOL_STORE_PASSWORD_FILE) { [IO.Path]::GetFullPath($env:ROCWOL_STORE_PASSWORD_FILE) } else { Join-Path $Signing 'store-password.txt' }
-$keyPasswordFile = if ($env:ROCWOL_KEY_PASSWORD_FILE) { [IO.Path]::GetFullPath($env:ROCWOL_KEY_PASSWORD_FILE) } else { Join-Path $Signing 'key-password.txt' }
-foreach ($file in @($keystore, $storePasswordFile, $keyPasswordFile)) {
-    $parentDirectory = [IO.Path]::GetDirectoryName($file)
-    if (-not (Test-Path -LiteralPath $parentDirectory)) { Protect-Directory $parentDirectory }
-}
-if (($keystore -ne (Join-Path $Signing 'roc-wol.p12')) -and -not (Test-Path -LiteralPath $keystore)) { throw 'Custom keystore override must already exist; newly generated release identities use the protected default signing directory.' }
-if (-not (Test-Path -LiteralPath $keystore)) {
-    if ((Test-Path -LiteralPath $storePasswordFile) -or (Test-Path -LiteralPath $keyPasswordFile)) { throw 'Signing state is incomplete. Restore the existing protected keystore; do not silently replace its identity.' }
-    $password = Random-Password
-    [IO.File]::WriteAllText($storePasswordFile, $password, $Utf8)
-    [IO.File]::WriteAllText($keyPasswordFile, $password, $Utf8)
-    Protect-File $storePasswordFile
-    Protect-File $keyPasswordFile
-    try {
-        Set-ProcessEnvironment 'ROCWOL_TEMP_STORE_PASSWORD' $password
-        Invoke-Native (Join-Path $JavaHome 'bin\keytool.exe') @('-genkeypair', '-storetype', 'PKCS12', '-keystore', $keystore, '-alias', 'roc-wol', '-keyalg', 'RSA', '-keysize', '3072', '-validity', '10000', '-dname', 'CN=Roc WOL Release', '-storepass:env', 'ROCWOL_TEMP_STORE_PASSWORD', '-keypass:env', 'ROCWOL_TEMP_STORE_PASSWORD', '-noprompt')
-    } finally { Set-ProcessEnvironment 'ROCWOL_TEMP_STORE_PASSWORD' $null; $password = $null }
-}
 foreach ($file in @($keystore, $storePasswordFile, $keyPasswordFile)) {
     if (-not (Test-Path -LiteralPath $file)) { throw 'Protected release signing files are incomplete.' }
     Protect-File $file
@@ -259,23 +226,28 @@ public class RocWolWrapperSeed {
         Invoke-Native (Join-Path $smokeDir 'roc-wol-agent.exe') @('--help')
     } finally { Remove-Item -LiteralPath $smokeDir -Recurse -Force -ErrorAction SilentlyContinue }
     Set-ProcessEnvironment 'GOOS' 'linux'
-    Set-ProcessEnvironment 'GOARCH' 'amd64'
-    Invoke-Native 'go' @('build', '-trimpath', '-ldflags=-s -w', '-o', (Join-Path $Dist 'roc-wol-linux-amd64'), './cmd/roc-wol')
-    Set-ProcessEnvironment 'GOARCH' 'arm64'
-    Invoke-Native 'go' @('build', '-trimpath', '-ldflags=-s -w', '-o', (Join-Path $Dist 'roc-wol-agent-linux-arm64'), './cmd/roc-wol-agent')
-    Invoke-Native (Join-Path $Root 'android\gradlew.bat') @('-p', (Join-Path $Root 'android'), '--no-daemon', "-Procwol.directOrigin=$DirectOrigin", "-Procwol.fallbackOrigin=$FallbackOrigin", ':app:assembleRelease')
+    $platforms = [ordered]@{}
+    foreach ($arch in @('amd64', 'arm64')) {
+        Set-ProcessEnvironment 'GOARCH' $arch
+        foreach ($role in @('gateway', 'agent')) {
+            $command = if ($role -eq 'gateway') { 'roc-wol' } else { 'roc-wol-agent' }
+            $name = "$command-linux-$arch"
+            Invoke-Native 'go' @('build', '-trimpath', '-ldflags=-s -w', '-o', (Join-Path $Dist $name), "./cmd/$command")
+            $platforms[$name] = [ordered]@{ os = 'linux'; arch = $arch; role = $role }
+        }
+    }
+    Invoke-Native (Join-Path $Root 'android\gradlew.bat') @('-p', (Join-Path $Root 'android'), '--no-daemon', ':app:assembleRelease')
     $builtApk = Join-Path $Root 'android\app\build\outputs\apk\release\app-release.apk'
     if (-not (Test-Path -LiteralPath $builtApk)) { throw 'Signed release APK is missing; no debug APK substitution is allowed.' }
     $apk = Join-Path $Dist 'roc-wol-release.apk'
-    Copy-Item -LiteralPath $builtApk -Destination $apk -Force
     $apksigner = Join-Path $Sdk 'build-tools\35.0.0\apksigner.bat'
-    $verification = (& $apksigner verify --verbose --print-certs $apk 2>&1) -join [Environment]::NewLine
+    $verification = (& $apksigner verify --verbose --print-certs $builtApk 2>&1) -join [Environment]::NewLine
     if ($LASTEXITCODE -ne 0) { throw 'Release APK signature verification failed.' }
     Write-Host $verification
     $fingerprint = [regex]::Match($verification, 'Signer #1 certificate SHA-256 digest:\s*([a-fA-F0-9]+)').Groups[1].Value.ToLowerInvariant()
-    if ($fingerprint -notmatch '^[a-f0-9]{64}$') { throw 'APK signer certificate fingerprint was not reported.' }
+    if ($fingerprint -ne '25182452bd65c3311cf5f4508b98bdfdd3636e8ca631d2b55cc7dee131fadad5') { throw 'APK signer does not match the official upgrade identity; existing release APK was not replaced.' }
     Add-Type -AssemblyName System.IO.Compression.FileSystem
-    $zip = [IO.Compression.ZipFile]::OpenRead($apk)
+    $zip = [IO.Compression.ZipFile]::OpenRead($builtApk)
     try {
         foreach ($entry in $zip.Entries) {
             if ($entry.FullName -match '(?i)(^|/)(SSH\.pem|账号密码\.txt|private|deployment\.json|agent\.json|gateway\.json)(/|$)|\.(?:p12|jks|key|pem)$') { throw 'Release APK contains a forbidden credential/configuration file.' }
@@ -285,14 +257,14 @@ public class RocWolWrapperSeed {
                 try {
                     $entryText = $reader.ReadToEnd()
                     if ($entryText -match '-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----') { throw 'Release APK contains private-key material.' }
-                    if ($null -ne $deployment -and $deployment.PSObject.Properties.Name -contains 'stcpKey' -and $entryText.Contains([string]$deployment.stcpKey)) { throw 'Release APK contains the deployment STCP secret.' }
                 } finally { $reader.Dispose(); $stream.Dispose() }
             }
         }
     } finally { $zip.Dispose() }
+    Copy-Item -LiteralPath $builtApk -Destination $apk -Force
     $checksums = [ordered]@{}
-    foreach ($name in @('roc-wol-linux-amd64', 'roc-wol-agent-linux-arm64', 'roc-wol-release.apk')) { $checksums[$name] = (Get-FileHash -LiteralPath (Join-Path $Dist $name) -Algorithm SHA256).Hash.ToLowerInvariant() }
-    $manifest = [ordered]@{ version = 1; builtAt = [DateTime]::UtcNow.ToString('o'); directOrigin = $DirectOrigin; fallbackOrigin = $FallbackOrigin; apkCertificateSHA256 = $fingerprint; sha256 = $checksums }
+    foreach ($name in (@($platforms.Keys) + @('roc-wol-release.apk'))) { $checksums[$name] = (Get-FileHash -LiteralPath (Join-Path $Dist $name) -Algorithm SHA256).Hash.ToLowerInvariant() }
+    $manifest = [ordered]@{ version = 2; apiVersion = 2; builtAt = [DateTime]::UtcNow.ToString('o'); apkCertificateSHA256 = $fingerprint; sha256 = $checksums; platforms = $platforms }
     [IO.File]::WriteAllText((Join-Path $Dist 'build-manifest.json'), ($manifest | ConvertTo-Json -Depth 5), $Utf8)
     [IO.File]::WriteAllText((Join-Path $Dist 'roc-wol-release.apk.sha256'), "$($checksums['roc-wol-release.apk'])  roc-wol-release.apk`n", $Utf8)
     Write-Host "Signed release: $apk"

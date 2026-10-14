@@ -25,7 +25,7 @@ func run() error {
 	flags.SetOutput(os.Stderr)
 	configPath := flags.String("config", "", "Required absolute or relative path to the agent JSON configuration")
 	flags.Usage = func() {
-		fmt.Fprintln(flags.Output(), "Usage: roc-wol-agent --config PATH\n\nLoopback-only mTLS router agent with fixed-target wake and LuCI proxy.")
+		fmt.Fprintln(flags.Output(), "Usage: roc-wol-agent --config PATH\n\nLoopback-only mTLS router agent with configured-target wake and optional LuCI proxy.")
 		flags.PrintDefaults()
 	}
 	if err := flags.Parse(os.Args[1:]); err != nil {

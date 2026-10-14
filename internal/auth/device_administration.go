@@ -96,7 +96,7 @@ func (s *State) ListDevices(device, id, signature, origin string) (protocol.Devi
 	if e != nil {
 		return protocol.DeviceList{}, e
 	}
-	out := protocol.DeviceList{Devices: make([]protocol.AdministeredDevice, 0, 5)}
+	out := protocol.DeviceList{Devices: make([]protocol.AdministeredDevice, 0, len(devices)), Capacity: s.maxDevices}
 	for _, d := range devices {
 		if !d.Revoked {
 			out.Devices = append(out.Devices, protocol.AdministeredDevice{

@@ -12,16 +12,21 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
 const ServiceID = "roc-wol"
 const JSONLimit = 16 << 10
+const ResponseJSONLimit = 64 << 10
+const APIVersion = 2
 const UploadLimit = 128 << 20
 
 type Error struct {
@@ -30,10 +35,27 @@ type Error struct {
 	RequestID string `json:"requestId,omitempty"`
 }
 type Wake struct {
+	TargetID  string     `json:"targetId"`
 	RequestID string     `json:"requestId"`
 	Result    string     `json:"result"`
 	SentAt    *time.Time `json:"sentAt,omitempty"`
 	Code      string     `json:"code,omitempty"`
+}
+
+type Info struct {
+	ServiceID  string `json:"serviceId"`
+	APIVersion int    `json:"apiVersion"`
+	InstanceID string `json:"instanceId"`
+}
+type TargetInfo struct {
+	TargetID string `json:"targetId"`
+	Name     string `json:"name"`
+	MAC      string `json:"mac"`
+	IP       string `json:"ip"`
+}
+type TargetList struct {
+	Targets           []TargetInfo `json:"targets"`
+	ManagementEnabled bool         `json:"managementEnabled"`
 }
 type Status struct {
 	TargetID     string     `json:"targetId"`
@@ -82,7 +104,8 @@ type AdministeredDevice struct {
 }
 
 type DeviceList struct {
-	Devices []AdministeredDevice `json:"devices"`
+	Devices  []AdministeredDevice `json:"devices"`
+	Capacity int                  `json:"capacity"`
 }
 
 type DeviceRevocation struct {
@@ -115,6 +138,117 @@ func ValidID(s string) bool {
 		}
 	}
 	return true
+}
+func ValidTargetID(s string) bool {
+	if len(s) < 1 || len(s) > 64 {
+		return false
+	}
+	for i, c := range s {
+		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || i > 0 && (c == '_' || c == '-')) {
+			return false
+		}
+	}
+	return true
+}
+func ValidName(s string) bool {
+	if !utf8.ValidString(s) || utf8.RuneCountInString(s) < 1 || utf8.RuneCountInString(s) > 64 {
+		return false
+	}
+	for _, c := range s {
+		if unicode.IsControl(c) {
+			return false
+		}
+	}
+	return true
+}
+func ValidTargetInfo(t TargetInfo) bool {
+	mac, err := net.ParseMAC(t.MAC)
+	if err != nil || len(mac) != 6 || mac[0]&1 != 0 {
+		return false
+	}
+	nonzero := false
+	for _, b := range mac {
+		nonzero = nonzero || b != 0
+	}
+	ip, err := netip.ParseAddr(t.IP)
+	return ValidTargetID(t.TargetID) && ValidName(t.Name) && nonzero && err == nil &&
+		ip.Is4() && !ip.IsUnspecified() && !ip.IsMulticast() && !ip.IsLoopback() && ip != netip.AddrFrom4([4]byte{255, 255, 255, 255})
+}
+func ValidTargetList(v TargetList) bool {
+	if len(v.Targets) < 1 || len(v.Targets) > 64 {
+		return false
+	}
+	seen := make(map[string]bool, len(v.Targets))
+	for _, t := range v.Targets {
+		if !ValidTargetInfo(t) || seen[t.TargetID] {
+			return false
+		}
+		seen[t.TargetID] = true
+	}
+	return true
+}
+
+// NormalizeOrigin accepts only a bare HTTPS origin, optionally ending in "/".
+func NormalizeOrigin(value string) (string, error) {
+	invalid := errors.New("invalid HTTPS origin")
+	if len(value) == 0 || len(value) > 512 {
+		return "", invalid
+	}
+	for _, c := range value {
+		if unicode.IsSpace(c) || unicode.IsControl(c) {
+			return "", invalid
+		}
+	}
+	u, err := url.Parse(value)
+	if err != nil || !strings.EqualFold(u.Scheme, "https") || u.User != nil || u.Opaque != "" || u.Host == "" ||
+		(u.Path != "" && u.Path != "/") || u.RawPath != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.ContainsAny(value, "\\%#?") {
+		return "", invalid
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return "", invalid
+	}
+	if ip, err := netip.ParseAddr(host); err == nil {
+		if ip.Is6() {
+			if !strings.HasPrefix(u.Host, "[") {
+				return "", invalid
+			}
+			host = "[" + ip.String() + "]"
+		} else {
+			if strings.HasPrefix(u.Host, "[") {
+				return "", invalid
+			}
+			host = ip.String()
+		}
+	} else {
+		if len(host) > 253 || strings.HasSuffix(host, ".") {
+			return "", invalid
+		}
+		for _, label := range strings.Split(host, ".") {
+			if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+				return "", invalid
+			}
+			for _, c := range label {
+				if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
+					return "", invalid
+				}
+			}
+		}
+	}
+	port := u.Port()
+	if strings.HasSuffix(u.Host, ":") {
+		return "", invalid
+	}
+	if port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return "", invalid
+		}
+		if n != 443 {
+			host += ":" + strconv.Itoa(n)
+		}
+	}
+	return "https://" + host, nil
 }
 func Hash(s string) string { h := sha256.Sum256([]byte(s)); return hex.EncodeToString(h[:]) }
 func Decode(s string) ([]byte, error) {

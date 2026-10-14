@@ -9,11 +9,14 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
 	"unicode/utf8"
+
+	"hubu.wiki/roc-wol/internal/protocol"
 )
 
 const GatewayURI = "urn:roc-wol:gateway"
@@ -37,6 +40,7 @@ type Config struct {
 	DataFile       string   `json:"dataFile"`
 	LuCIOrigin     string   `json:"luciOrigin"`
 	PingPath       string   `json:"pingPath"`
+	EtherwakePath  string   `json:"etherwakePath"`
 	Targets        []Target `json:"targets"`
 }
 
@@ -52,10 +56,19 @@ func LoadConfig(path string) (Config, error) {
 	if err := strictJSON(data, &c); err != nil {
 		return c, fmt.Errorf("configuration: %w", err)
 	}
+	c = c.normalized()
 	return c, c.Validate()
 }
 
+func (c Config) normalized() Config {
+	if c.EtherwakePath == "" {
+		c.EtherwakePath = "/usr/bin/etherwake"
+	}
+	return c
+}
+
 func (c Config) Validate() error {
+	c = c.normalized()
 	host, port, err := net.SplitHostPort(c.Listen)
 	if err != nil {
 		return errors.New("listen must be a loopback IP and port")
@@ -68,21 +81,79 @@ func (c Config) Validate() error {
 	if c.ClientURI != GatewayURI {
 		return errors.New("clientURI must identify the roc-wol gateway")
 	}
-	for _, p := range []string{c.ServerCertFile, c.ServerKeyFile, c.ClientCAFile, c.DataFile, c.PingPath} {
-		if p == "" || !filepath.IsAbs(p) {
-			return errors.New("certificate, key, database and ping paths must be absolute")
+	for _, p := range []string{c.ServerCertFile, c.ServerKeyFile, c.ClientCAFile, c.DataFile, c.PingPath, c.EtherwakePath} {
+		if p == "" || !(filepath.IsAbs(p) || path.IsAbs(p)) || strings.ContainsAny(p, "\x00\r\n") {
+			return errors.New("certificate, key, database and executable paths must be absolute")
 		}
 	}
-	u, err := url.Parse(c.LuCIOrigin)
-	if err != nil || u.Scheme != "http" || u.Host != "127.0.0.1:80" || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
-		return errors.New("luciOrigin must be http://127.0.0.1:80")
+	if c.LuCIOrigin != "" {
+		if _, err := luciOrigin(c.LuCIOrigin); err != nil {
+			return err
+		}
 	}
-	if len(c.Targets) != 1 {
-		return errors.New("exactly one configured desktop target is required")
+	if len(c.Targets) < 1 || len(c.Targets) > 64 {
+		return errors.New("between 1 and 64 targets are required")
 	}
-	t := c.Targets[0]
-	if t.ID != "desktop" || t.Name != "DESKTOP-IENBTJG" || t.MAC != "B0:25:AA:83:C6:EF" || t.Interface != "br-lan" || !t.Broadcast || t.IP != "192.168.2.100" {
-		return errors.New("target does not match the approved fixed desktop")
+	seen := make(map[string]bool, len(c.Targets))
+	for _, t := range c.Targets {
+		if !protocol.ValidTargetInfo(protocol.TargetInfo{TargetID: t.ID, Name: t.Name, MAC: t.MAC, IP: t.IP}) || seen[t.ID] {
+			return errors.New("invalid or duplicate target")
+		}
+		seen[t.ID] = true
+		if len(t.Interface) < 1 || len(t.Interface) > 15 {
+			return errors.New("invalid target interface")
+		}
+		for _, ch := range t.Interface {
+			if !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || strings.ContainsRune("_.:-", ch)) {
+				return errors.New("invalid target interface")
+			}
+		}
+	}
+	return nil
+}
+
+// luciOrigin deliberately accepts only an IP literal: DNS resolution must not
+// turn a configured loopback management endpoint into a remote destination.
+func luciOrigin(value string) (*url.URL, error) {
+	invalid := errors.New("luciOrigin must be a loopback HTTP origin")
+	if strings.ContainsAny(value, "\\%?# \t\r\n") {
+		return nil, invalid
+	}
+	u, err := url.Parse(value)
+	if err != nil || u.Scheme != "http" || u.User != nil || u.Opaque != "" || u.Path != "" || u.RawPath != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return nil, invalid
+	}
+	ip := net.ParseIP(u.Hostname())
+	if ip == nil || !ip.IsLoopback() || strings.HasSuffix(u.Host, ":") {
+		return nil, invalid
+	}
+	port := 80
+	if u.Port() != "" {
+		port, err = strconv.Atoi(u.Port())
+		if err != nil || port < 1 || port > 65535 {
+			return nil, invalid
+		}
+	}
+	u.Host = net.JoinHostPort(ip.String(), strconv.Itoa(port))
+	return u, nil
+}
+
+func (c Config) validateRuntime() error {
+	for _, path := range []string{c.PingPath, c.EtherwakePath} {
+		info, err := os.Stat(path)
+		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
+			return errors.New("configured executable is unavailable or not executable")
+		}
+	}
+	seen := make(map[string]bool, len(c.Targets))
+	for _, target := range c.Targets {
+		if seen[target.Interface] {
+			continue
+		}
+		if _, err := net.InterfaceByName(target.Interface); err != nil {
+			return errors.New("configured target interface is unavailable")
+		}
+		seen[target.Interface] = true
 	}
 	return nil
 }
@@ -93,6 +164,21 @@ func strictJSON(data []byte, dst any) error {
 		return errors.New("JSON must be valid UTF-8")
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
+	var jsonField func(reflect.Type, string) reflect.Type
+	jsonField = func(typ reflect.Type, key string) reflect.Type {
+		for i := range typ.NumField() {
+			field := typ.Field(i)
+			if strings.Split(field.Tag.Get("json"), ",")[0] == key {
+				return field.Type
+			}
+			if field.Anonymous && field.Type.Kind() == reflect.Struct {
+				if nested := jsonField(field.Type, key); nested != nil {
+					return nested
+				}
+			}
+		}
+		return nil
+	}
 	var value func(reflect.Type) error
 	value = func(typ reflect.Type) error {
 		for typ.Kind() == reflect.Pointer {
@@ -122,14 +208,7 @@ func strictJSON(data []byte, dst any) error {
 					return errors.New("duplicate or invalid JSON key")
 				}
 				keys[k] = true
-				var fieldType reflect.Type
-				for i := range typ.NumField() {
-					field := typ.Field(i)
-					if strings.Split(field.Tag.Get("json"), ",")[0] == k {
-						fieldType = field.Type
-						break
-					}
-				}
+				fieldType := jsonField(typ, k)
 				if fieldType == nil {
 					return errors.New("unknown JSON field")
 				}

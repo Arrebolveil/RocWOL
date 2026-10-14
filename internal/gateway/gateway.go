@@ -18,16 +18,18 @@ import (
 )
 
 type Gateway struct {
-	cfg        Config
-	DB         *store.Store
-	Auth       *auth.State
-	client     *http.Client
-	proxy      *httputil.ReverseProxy
-	origins    map[string]string
-	wakeMu     sync.Mutex
-	wakeRates  map[string][]time.Time
-	freshMu    sync.Mutex
-	freshRates map[string]time.Time
+	cfg            Config
+	DB             *store.Store
+	Auth           *auth.State
+	client         *http.Client
+	proxy          *httputil.ReverseProxy
+	origins        map[string]string
+	wakeMu         sync.Mutex
+	wakeRates      map[string][]time.Time
+	freshMu        sync.Mutex
+	freshRates     map[string]time.Time
+	targetMu       sync.RWMutex
+	targetSnapshot map[string]protocol.TargetInfo
 }
 
 func New(c Config) (*Gateway, error) {
@@ -47,7 +49,10 @@ func New(c Config) (*Gateway, error) {
 	return g, nil
 }
 func newGateway(c Config, db *store.Store, tr http.RoundTripper) *Gateway {
-	g := &Gateway{cfg: c, DB: db, Auth: auth.New(db), client: &http.Client{Transport: tr, Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, origins: map[string]string{}, wakeRates: map[string][]time.Time{}}
+	if c.MaxDevices == 0 {
+		c.MaxDevices = 5
+	}
+	g := &Gateway{cfg: c, DB: db, Auth: auth.New(db, c.MaxDevices), client: &http.Client{Transport: tr, Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, origins: map[string]string{}, wakeRates: map[string][]time.Time{}}
 	for _, o := range c.PublicOrigins {
 		u, _ := url.Parse(o)
 		g.origins[u.Host] = o
@@ -107,7 +112,11 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		g.page(w, "style.css")
 		return
 	}
-	if strings.HasPrefix(p, "/_wol/v1/") {
+	if p == "/_wol/v1" || strings.HasPrefix(p, "/_wol/v1/") {
+		protocol.Fail(w, 426, "protocol_upgrade_required")
+		return
+	}
+	if strings.HasPrefix(p, "/_wol/v2/") {
 		g.api(w, r, origin)
 		return
 	}
@@ -125,6 +134,15 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
+	enabled, e := g.managementAvailable(r)
+	if e != nil {
+		protocol.Fail(w, 503, "agent_unavailable")
+		return
+	}
+	if !enabled {
+		g.page(w, "unauthorized.html", http.StatusUnauthorized)
+		return
+	}
 	if r.ContentLength > protocol.UploadLimit {
 		protocol.Fail(w, 413, "invalid_request")
 		return
@@ -180,8 +198,17 @@ func respondError(w http.ResponseWriter, e error) {
 }
 func (g *Gateway) api(w http.ResponseWriter, r *http.Request, origin string) {
 	p := r.URL.Path
+	isTargetStatus := strings.HasPrefix(p, "/_wol/v2/targets/") && r.Method == "GET"
+	if r.URL.RawQuery != "" && !(isTargetStatus && r.URL.RawQuery == "fresh=1") {
+		protocol.Fail(w, 400, "invalid_request")
+		return
+	}
+	if p == "/_wol/v2/info" && r.Method == "GET" {
+		protocol.JSON(w, 200, protocol.Info{ServiceID: protocol.ServiceID, APIVersion: protocol.APIVersion, InstanceID: g.DB.InstanceID()})
+		return
+	}
 	switch {
-	case p == "/_wol/v1/pair/challenge" && r.Method == "POST":
+	case p == "/_wol/v2/pair/challenge" && r.Method == "POST":
 		var v struct {
 			Code            string `json:"code"`
 			DeviceName      string `json:"deviceName"`
@@ -198,7 +225,7 @@ func (g *Gateway) api(w http.ResponseWriter, r *http.Request, origin string) {
 		}
 		protocol.JSON(w, 200, result)
 		return
-	case p == "/_wol/v1/pair/complete" && r.Method == "POST":
+	case p == "/_wol/v2/pair/complete" && r.Method == "POST":
 		var v struct {
 			ChallengeID     string `json:"challengeId"`
 			WakeSignature   string `json:"wakeSignature"`
@@ -214,7 +241,7 @@ func (g *Gateway) api(w http.ResponseWriter, r *http.Request, origin string) {
 		}
 		protocol.JSON(w, 200, result)
 		return
-	case p == "/_wol/v1/auth/challenge" && r.Method == "POST":
+	case p == "/_wol/v2/auth/challenge" && r.Method == "POST":
 		var v struct {
 			DeviceID string `json:"deviceId"`
 		}
@@ -232,7 +259,7 @@ func (g *Gateway) api(w http.ResponseWriter, r *http.Request, origin string) {
 		}
 		protocol.JSON(w, 200, result)
 		return
-	case p == "/_wol/v1/auth/complete" && r.Method == "POST":
+	case p == "/_wol/v2/auth/complete" && r.Method == "POST":
 		var v struct {
 			DeviceID    string `json:"deviceId"`
 			ChallengeID string `json:"challengeId"`
@@ -248,7 +275,10 @@ func (g *Gateway) api(w http.ResponseWriter, r *http.Request, origin string) {
 		}
 		protocol.JSON(w, 200, result)
 		return
-	case p == "/_wol/v1/manage/redeem" && r.Method == "POST":
+	case p == "/_wol/v2/manage/redeem" && r.Method == "POST":
+		if !g.requireManagement(w, r) {
+			return
+		}
 		var v struct {
 			Ticket string `json:"ticket"`
 		}
@@ -269,8 +299,9 @@ func (g *Gateway) api(w http.ResponseWriter, r *http.Request, origin string) {
 		protocol.JSON(w, 200, map[string]string{"redirect": "/cgi-bin/luci/"})
 		return
 	}
-	known := p == "/_wol/v1/target" && r.Method == "GET" || p == "/_wol/v1/wake" && r.Method == "POST" || strings.HasPrefix(p, "/_wol/v1/wake/") && r.Method == "GET" || p == "/_wol/v1/manage/challenge" && r.Method == "POST" || p == "/_wol/v1/manage/authorize" && r.Method == "POST" || p == "/_wol/v1/manage/browser" && r.Method == "POST" || p == "/_wol/v1/manage/status" && r.Method == "GET" || p == "/_wol/v1/manage/end" && r.Method == "POST"
+	known := p == "/_wol/v2/targets" && r.Method == "GET" || p == "/_wol/v2/wake" && r.Method == "POST" || strings.HasPrefix(p, "/_wol/v2/wake/") && r.Method == "GET" || p == "/_wol/v2/manage/challenge" && r.Method == "POST" || p == "/_wol/v2/manage/authorize" && r.Method == "POST" || p == "/_wol/v2/manage/browser" && r.Method == "POST" || p == "/_wol/v2/manage/status" && r.Method == "GET" || p == "/_wol/v2/manage/end" && r.Method == "POST"
 	known = known || deviceAdministrationRoute(p, r.Method)
+	known = known || isTargetStatus
 	if !known {
 		protocol.Fail(w, 404, "not_found")
 		return
@@ -291,8 +322,11 @@ func (g *Gateway) api(w http.ResponseWriter, r *http.Request, origin string) {
 		g.deviceAdministration(w, r, device, origin)
 		return
 	}
+	if strings.HasPrefix(p, "/_wol/v2/manage/") && p != "/_wol/v2/manage/end" && !g.requireManagement(w, r) {
+		return
+	}
 	switch {
-	case p == "/_wol/v1/manage/end" && r.Method == "POST":
+	case p == "/_wol/v2/manage/end" && r.Method == "POST":
 		if !body(w, r, &struct{}{}) {
 			return
 		}
@@ -301,9 +335,11 @@ func (g *Gateway) api(w http.ResponseWriter, r *http.Request, origin string) {
 			return
 		}
 		protocol.JSON(w, 200, map[string]bool{"ended": true})
-	case p == "/_wol/v1/target" && r.Method == "GET":
-		g.target(w, r, device)
-	case p == "/_wol/v1/wake" && r.Method == "POST":
+	case p == "/_wol/v2/targets" && r.Method == "GET":
+		g.targets(w, r)
+	case isTargetStatus:
+		g.target(w, r, device, strings.TrimPrefix(p, "/_wol/v2/targets/"))
+	case p == "/_wol/v2/wake" && r.Method == "POST":
 		var v struct {
 			TargetID  string `json:"targetId"`
 			RequestID string `json:"requestId"`
@@ -311,19 +347,19 @@ func (g *Gateway) api(w http.ResponseWriter, r *http.Request, origin string) {
 		if !body(w, r, &v) {
 			return
 		}
-		if v.TargetID != "desktop" || !protocol.ValidID(v.RequestID) {
+		if !protocol.ValidTargetID(v.TargetID) || !protocol.ValidID(v.RequestID) {
 			protocol.Fail(w, 400, "invalid_request")
 			return
 		}
-		g.wake(w, r, device, v.RequestID, true)
-	case strings.HasPrefix(p, "/_wol/v1/wake/") && r.Method == "GET":
-		id := strings.TrimPrefix(p, "/_wol/v1/wake/")
+		g.wake(w, r, device, v.RequestID, v.TargetID, true)
+	case strings.HasPrefix(p, "/_wol/v2/wake/") && r.Method == "GET":
+		id := strings.TrimPrefix(p, "/_wol/v2/wake/")
 		if !protocol.ValidID(id) {
 			protocol.Fail(w, 400, "invalid_request")
 			return
 		}
-		g.wake(w, r, device, id, false)
-	case p == "/_wol/v1/manage/challenge" && r.Method == "POST":
+		g.wake(w, r, device, id, "", false)
+	case p == "/_wol/v2/manage/challenge" && r.Method == "POST":
 		var v struct {
 			Origin          string `json:"origin"`
 			SessionMinutes  *int   `json:"sessionMinutes"`
@@ -346,7 +382,7 @@ func (g *Gateway) api(w http.ResponseWriter, r *http.Request, origin string) {
 			return
 		}
 		protocol.JSON(w, 200, result)
-	case p == "/_wol/v1/manage/authorize" && r.Method == "POST":
+	case p == "/_wol/v2/manage/authorize" && r.Method == "POST":
 		var v struct {
 			ChallengeID string `json:"challengeId"`
 			Signature   string `json:"signature"`
@@ -364,7 +400,7 @@ func (g *Gateway) api(w http.ResponseWriter, r *http.Request, origin string) {
 			return
 		}
 		protocol.JSON(w, 200, result)
-	case p == "/_wol/v1/manage/status" && r.Method == "GET":
+	case p == "/_wol/v2/manage/status" && r.Method == "GET":
 		result, e := g.Auth.ManagementStatus(device)
 		if e != nil {
 			respondError(w, e)
@@ -375,7 +411,7 @@ func (g *Gateway) api(w http.ResponseWriter, r *http.Request, origin string) {
 			return
 		}
 		protocol.JSON(w, 200, result)
-	case p == "/_wol/v1/manage/browser" && r.Method == "POST":
+	case p == "/_wol/v2/manage/browser" && r.Method == "POST":
 		if !body(w, r, &struct{}{}) {
 			return
 		}

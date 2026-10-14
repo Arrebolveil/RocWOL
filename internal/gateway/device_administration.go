@@ -7,22 +7,22 @@ import (
 )
 
 func deviceAdministrationRoute(path, method string) bool {
-	return path == "/_wol/v1/devices/access" && method == "GET" ||
-		(path == "/_wol/v1/devices/challenge" || path == "/_wol/v1/devices/list" || path == "/_wol/v1/devices/revoke") && method == "POST"
+	return path == "/_wol/v2/devices/access" && method == "GET" ||
+		(path == "/_wol/v2/devices/challenge" || path == "/_wol/v2/devices/list" || path == "/_wol/v2/devices/revoke") && method == "POST"
 }
 
 // The shared API entrypoint has already admitted a revocation-aware bearer
 // context. Browser cookies and LuCI authorization never reach this handler.
 func (g *Gateway) deviceAdministration(w http.ResponseWriter, r *http.Request, device, origin string) {
 	switch r.URL.Path {
-	case "/_wol/v1/devices/access":
+	case "/_wol/v2/devices/access":
 		result, e := g.Auth.DeviceAdministrationAccess(device)
 		if e != nil {
 			respondError(w, e)
 			return
 		}
 		protocol.JSON(w, 200, result)
-	case "/_wol/v1/devices/challenge":
+	case "/_wol/v2/devices/challenge":
 		var v struct {
 			Origin         string `json:"origin"`
 			Action         string `json:"action"`
@@ -41,7 +41,7 @@ func (g *Gateway) deviceAdministration(w http.ResponseWriter, r *http.Request, d
 			return
 		}
 		protocol.JSON(w, 200, result)
-	case "/_wol/v1/devices/list":
+	case "/_wol/v2/devices/list":
 		var v struct {
 			ChallengeID string `json:"challengeId"`
 			Signature   string `json:"signature"`
@@ -55,7 +55,7 @@ func (g *Gateway) deviceAdministration(w http.ResponseWriter, r *http.Request, d
 			return
 		}
 		protocol.JSON(w, 200, result)
-	case "/_wol/v1/devices/revoke":
+	case "/_wol/v2/devices/revoke":
 		var v struct {
 			ChallengeID    string `json:"challengeId"`
 			Signature      string `json:"signature"`

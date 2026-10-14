@@ -1,6 +1,6 @@
 [Unit]
 Description=Renew and atomically install Roc WOL public certificates
-After=network-online.target docker.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
@@ -10,4 +10,4 @@ UMask=0077
 ExecStart=/opt/roc-wol/bin/renew-certificates.sh
 PrivateTmp=yes
 ProtectHome=read-only
-ReadWritePaths=/root/roc-wol-private
+ReadWritePaths=/opt/roc-wol/acme /opt/roc-wol/rollback /run

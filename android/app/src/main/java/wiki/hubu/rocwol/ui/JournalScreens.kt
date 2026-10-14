@@ -44,8 +44,13 @@ import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.selected
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.launch
+import wiki.hubu.rocwol.data.ServerProfile
+import wiki.hubu.rocwol.data.journal.JournalAliases
+import wiki.hubu.rocwol.data.journal.LEGACY_JOURNAL_PROFILE_ID
 import wiki.hubu.rocwol.data.journal.JournalCategory
 import wiki.hubu.rocwol.data.journal.JournalHealth
 import wiki.hubu.rocwol.data.journal.JournalProblem
@@ -58,7 +63,13 @@ import java.time.format.DateTimeFormatter
 
 @OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
-fun JournalScreen(journal: OperationJournal, onBack: () -> Unit) {
+fun JournalScreen(
+    journal: OperationJournal,
+    onBack: () -> Unit,
+    activeProfileId: String?,
+    selectedTargetId: String?,
+    profiles: List<ServerProfile>
+) {
     BackHandler(onBack = onBack)
     val records by journal.records.collectAsStateWithLifecycle()
     val health by journal.health.collectAsStateWithLifecycle()
@@ -72,15 +83,23 @@ fun JournalScreen(journal: OperationJournal, onBack: () -> Unit) {
     var clearConfirmation by rememberSaveable { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
     var selected by remember { mutableStateOf<JournalRecord?>(null) }
+    val aliases = remember(records) { JournalAliases().also { names -> records.forEach { names.server(it); names.target(it) } } }
     val zone = ZoneId.systemDefault()
-    val groups = remember(records, category, failuresOnly, zone) {
-        records.filter { (category == null || it.event.category == category) && (!failuresOnly || it.isFailure) }
+    var profileFilter by rememberSaveable(activeProfileId) { mutableStateOf("current") }
+    var targetFilter by rememberSaveable(activeProfileId, selectedTargetId) { mutableStateOf("all") }
+    val filteredRecords = remember(records, profileFilter, targetFilter, activeProfileId, selectedTargetId) {
+        records.filter { matchesJournalScope(it, profileFilter, targetFilter, activeProfileId, selectedTargetId) }
+    }
+    val groups = remember(filteredRecords, category, failuresOnly, zone) {
+        filteredRecords.filter { (category == null || it.event.category == category) && (!failuresOnly || it.isFailure) }
             .groupBy { it.timestamp.atZone(zone).toLocalDate() }
     }
     Scaffold(snackbarHost = { SnackbarHost(snackbar) }) { padding ->
         Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.TopCenter) {
             Column(Modifier.widthIn(max = 840.dp).fillMaxSize()) {
                 JournalHeading("操作日志", onBack)
+                JournalScopeFilters(records, profiles, activeProfileId, selectedTargetId, profileFilter, targetFilter,
+                    onProfile = { profileFilter = it; targetFilter = "all" }, onTarget = { targetFilter = it })
                 FlowRow(Modifier.fillMaxWidth().padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Box {
                         OutlinedButton(onClick = { categoryMenu = true }) { Text(category?.label ?: "全部分类") }
@@ -114,19 +133,21 @@ fun JournalScreen(journal: OperationJournal, onBack: () -> Unit) {
                 if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
                 LazyColumn(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     item {
-                        Text("仅保留本机最近 7 天、最多 2000 条记录。自动重复检查会合并；用户操作逐条保留。导出包含服务入口和请求 ID，不包含凭据或设备地址。",
+                        Text("全 App 合计保留最近 7 天、最多 2000 条记录。自动重复检查会合并；用户操作逐条保留。导出全部服务器日志，服务器、电脑、线路使用稳定的本地别名，不包含域名、名称或原始标识。",
                             modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     if (groups.isEmpty() && health.loaded) item {
-                        Text(if (category != null || failuresOnly) "没有符合筛选条件的记录" else "暂无本机操作日志", Modifier.padding(24.dp))
+                        Text(if (records.isNotEmpty() || category != null || failuresOnly) "没有符合筛选条件的记录" else "暂无本机操作日志", Modifier.padding(24.dp))
                     }
                     groups.forEach { (date, entries) ->
                         item(key = "date-$date") {
                             Text(date.toString(), Modifier.padding(horizontal = 20.dp, vertical = 8.dp), style = MaterialTheme.typography.titleSmall)
                         }
                         items(entries, key = { it.id }) { entry ->
-                            JournalEntryCard(entry, onClick = { selected = entry })
+                            JournalEntryCard(entry,
+                                scopeLabel = "${journalServerLabel(entry, profiles, aliases)}${if (entry.targetId != null) " · ${aliases.target(entry)}" else ""}",
+                                onClick = { selected = entry })
                         }
                     }
                     item { Text("已确认写入的记录可在重启后保留；等待写入的记录可能因进程终止而丢失。",
@@ -158,21 +179,33 @@ fun JournalScreen(journal: OperationJournal, onBack: () -> Unit) {
 }
 
 @Composable
-fun WakeHistoryScreen(journal: OperationJournal, onBack: () -> Unit) {
+fun WakeHistoryScreen(
+    journal: OperationJournal,
+    onBack: () -> Unit,
+    activeProfileId: String?,
+    selectedTargetId: String?,
+    profiles: List<ServerProfile>
+) {
     BackHandler(onBack = onBack)
     val records by journal.records.collectAsStateWithLifecycle()
     val health by journal.health.collectAsStateWithLifecycle()
     var selected by remember { mutableStateOf<JournalRecord?>(null) }
-    val groups = remember(records) {
-        records.filter { it.event.category == JournalCategory.WAKE && it.event.requestId != null }
-            .groupBy { it.event.requestId!! }
-            .map { (requestId, values) -> requestId to values.sortedWith(compareBy<JournalRecord> { it.timestamp }.thenBy { it.id }) }
+    var profileFilter by rememberSaveable(activeProfileId) { mutableStateOf("current") }
+    var targetFilter by rememberSaveable(activeProfileId, selectedTargetId) { mutableStateOf("current") }
+    val aliases = remember(records) { JournalAliases().also { names -> records.forEach { names.server(it); names.target(it) } } }
+    val groups = remember(records, profileFilter, targetFilter, activeProfileId, selectedTargetId) {
+        records.filter { it.event.category == JournalCategory.WAKE && it.historyKey != null &&
+            matchesJournalScope(it, profileFilter, targetFilter, activeProfileId, selectedTargetId) }
+            .groupBy { it.historyKey!! }
+            .map { (key, values) -> key to values.sortedWith(compareBy<JournalRecord> { it.timestamp }.thenBy { it.id }) }
             .sortedByDescending { (_, values) -> values.maxOf { it.lastTimestamp } }
     }
     Scaffold { padding ->
         Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.TopCenter) {
             Column(Modifier.widthIn(max = 840.dp).fillMaxSize()) {
                 JournalHeading("唤醒历史", onBack)
+                JournalScopeFilters(records, profiles, activeProfileId, selectedTargetId, profileFilter, targetFilter,
+                    onProfile = { profileFilter = it; targetFilter = "all" }, onTarget = { targetFilter = it })
                 JournalHealthBanner(health)
                 LazyColumn(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     item {
@@ -180,9 +213,11 @@ fun WakeHistoryScreen(journal: OperationJournal, onBack: () -> Unit) {
                             Modifier.padding(16.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     if (groups.isEmpty() && health.loaded) item { Text("暂无本机唤醒历史", Modifier.padding(24.dp)) }
-                    groups.forEach { (requestId, timeline) ->
-                        item(key = requestId) {
-                            WakeRequestCard(requestId, timeline, onSelect = { selected = it })
+                    groups.forEach { (key, timeline) ->
+                        item(key = "${key.profileId}|${key.targetId}|${key.requestId}") {
+                            WakeRequestCard(key.requestId, timeline,
+                                scopeLabel = "${journalServerLabel(timeline.first(), profiles, aliases)} · ${aliases.target(timeline.first())}",
+                                onSelect = { selected = it })
                         }
                     }
                 }
@@ -190,6 +225,96 @@ fun WakeHistoryScreen(journal: OperationJournal, onBack: () -> Unit) {
         }
     }
     selected?.let { JournalEntryDetails(it, onDismiss = { selected = null }) }
+}
+
+internal fun matchesJournalScope(
+    record: JournalRecord,
+    profileFilter: String,
+    targetFilter: String,
+    activeProfileId: String?,
+    selectedTargetId: String?
+): Boolean {
+    val profileMatches = when (profileFilter) {
+        "all" -> true
+        "current" -> activeProfileId != null && record.profileId == activeProfileId
+        "unknown" -> record.profileId == null
+        else -> profileFilter.startsWith("profile:") && record.profileId == profileFilter.removePrefix("profile:")
+    }
+    val targetMatches = when (targetFilter) {
+        "all" -> true
+        "current" -> selectedTargetId == null || record.profileId == activeProfileId && record.targetId == selectedTargetId
+        "unknown" -> record.targetId == null
+        else -> targetFilter.startsWith("target:") && targetFilter.removePrefix("target:").let { dimension ->
+            if (!dimension.contains('|')) return@let false
+            val profile = dimension.substringBefore('|').ifEmpty { null }
+            val target = dimension.substringAfter('|').ifEmpty { null }
+            record.profileId == profile && record.targetId == target
+        }
+    }
+    return profileMatches && targetMatches
+}
+
+internal fun journalServerLabel(record: JournalRecord, profiles: List<ServerProfile>, aliases: JournalAliases): String =
+    profiles.firstOrNull { it.profileId == record.profileId }?.displayName ?: when (record.profileId) {
+        null -> "旧记录 / 未知服务器"
+        LEGACY_JOURNAL_PROFILE_ID -> "已移除服务器 · 原有服务器（历史）"
+        else -> "已移除服务器 · ${aliases.server(record)}"
+    }
+
+@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
+@Composable
+private fun JournalScopeFilters(
+    records: List<JournalRecord>,
+    profiles: List<ServerProfile>,
+    activeProfileId: String?,
+    selectedTargetId: String?,
+    profileFilter: String,
+    targetFilter: String,
+    onProfile: (String) -> Unit,
+    onTarget: (String) -> Unit
+) {
+    var serverMenu by remember { mutableStateOf(false) }
+    var targetMenu by remember { mutableStateOf(false) }
+    val aliases = remember(records) { JournalAliases().also { names -> records.forEach { names.server(it); names.target(it) } } }
+    val serverChoices = remember(records, profiles, activeProfileId) {
+        linkedMapOf("current" to ("当前服务器：" + (profiles.firstOrNull { it.profileId == activeProfileId }?.displayName ?: "未选择")),
+            "all" to "全部服务器").apply {
+            profiles.forEach { put("profile:${it.profileId}", it.displayName) }
+            records.distinctBy { it.profileId }.forEach { record ->
+                putIfAbsent(record.profileId?.let { "profile:$it" } ?: "unknown", journalServerLabel(record, profiles, aliases))
+            }
+        }
+    }
+    val targetChoices = remember(records, profileFilter, activeProfileId, selectedTargetId) {
+        linkedMapOf("current" to if (selectedTargetId == null) "当前电脑：未选择（全部电脑）" else "当前服务器的电脑",
+            "all" to "全部电脑").apply {
+            records.filter { matchesJournalScope(it, profileFilter, "all", activeProfileId, selectedTargetId) }
+                .distinctBy { it.profileId to it.targetId }.forEach { record ->
+                    val label = if (profileFilter == "all") "${aliases.server(record)} · ${aliases.target(record)}" else aliases.target(record)
+                    putIfAbsent("target:${record.profileId.orEmpty()}|${record.targetId.orEmpty()}", label)
+                }
+        }
+    }
+    FlowRow(Modifier.fillMaxWidth().padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Box {
+            OutlinedButton(onClick = { serverMenu = true }) { Text(serverChoices[profileFilter] ?: "服务器筛选") }
+            DropdownMenu(expanded = serverMenu, onDismissRequest = { serverMenu = false }) {
+                serverChoices.forEach { (key, label) ->
+                    DropdownMenuItem(text = { Text(label) }, modifier = Modifier.semantics { selected = key == profileFilter },
+                        onClick = { onProfile(key); serverMenu = false })
+                }
+            }
+        }
+        Box {
+            OutlinedButton(onClick = { targetMenu = true }) { Text(targetChoices[targetFilter] ?: "电脑筛选") }
+            DropdownMenu(expanded = targetMenu, onDismissRequest = { targetMenu = false }) {
+                targetChoices.forEach { (key, label) ->
+                    DropdownMenuItem(text = { Text(label) }, modifier = Modifier.semantics { selected = key == targetFilter },
+                        onClick = { onTarget(key); targetMenu = false })
+                }
+            }
+        }
+    }
 }
 
 @Composable
@@ -215,11 +340,12 @@ private fun JournalHealthBanner(health: JournalHealth) {
 }
 
 @Composable
-private fun JournalEntryCard(entry: JournalRecord, onClick: () -> Unit) {
+private fun JournalEntryCard(entry: JournalRecord, scopeLabel: String, onClick: () -> Unit) {
     Card(onClick = onClick, modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text("${entry.event.action.label} · ${entry.event.outcome.label}", style = MaterialTheme.typography.titleMedium,
                 color = if (entry.isFailure) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface)
+            Text(scopeLabel, style = MaterialTheme.typography.bodyMedium)
             Text("${journalTime(entry)} · ${entry.event.trigger.label}${if (entry.occurrences > 1) " · 合并 ${entry.occurrences} 次" else ""}",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             entry.event.wakeStage?.let { Text(it.label, style = MaterialTheme.typography.bodyMedium) }
@@ -229,9 +355,10 @@ private fun JournalEntryCard(entry: JournalRecord, onClick: () -> Unit) {
 }
 
 @Composable
-private fun WakeRequestCard(requestId: String, timeline: List<JournalRecord>, onSelect: (JournalRecord) -> Unit) {
-    var expanded by rememberSaveable(requestId) { mutableStateOf(false) }
-    var page by rememberSaveable(requestId) { mutableIntStateOf(0) }
+private fun WakeRequestCard(requestId: String, timeline: List<JournalRecord>, scopeLabel: String, onSelect: (JournalRecord) -> Unit) {
+    val key = timeline.first().historyKey
+    var expanded by rememberSaveable(key) { mutableStateOf(false) }
+    var page by rememberSaveable(key) { mutableIntStateOf(0) }
     val lastPage = (timeline.size - 1) / 20
     val currentPage = page.coerceAtMost(lastPage)
     val end = timeline.size - currentPage * 20
@@ -240,6 +367,7 @@ private fun WakeRequestCard(requestId: String, timeline: List<JournalRecord>, on
     Card(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text(stage?.label ?: "尚无确定结果", style = MaterialTheme.typography.titleMedium)
+            Text(scopeLabel, style = MaterialTheme.typography.bodyMedium)
             SelectionContainer { Text("请求 ID：$requestId", style = MaterialTheme.typography.bodySmall) }
             Text(journalTime(timeline.first()), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             if (stage == WakeStage.SENT) Text("仅确认唤醒包已发送，未确认电脑开机。", style = MaterialTheme.typography.bodySmall)

@@ -121,7 +121,7 @@ func TestInvalidPublicFloodPreservesClientAdmission(t *testing.T) {
 			if device, err := s.Token(credentials.AccessToken); err != nil || device != owner.DeviceID {
 				t.Fatalf("authentication did not issue usable credentials: %q %v", device, err)
 			}
-			origin := "https://wol.hubu.wiki"
+			origin := "https://wol.example"
 			finite := authorize(t, s, k, owner.DeviceID, origin, 5, false)
 			permanent := authorize(t, s, k, other.DeviceID, origin, 0, false)
 			if !finite.Active || !finite.ExpiresAt.Equal(now.Add(5*time.Minute)) || !permanent.Active || !permanent.ExpiresAt.IsZero() {

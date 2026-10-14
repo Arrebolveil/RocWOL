@@ -54,7 +54,7 @@ func state(t *testing.T) *State {
 		t.Fatal(e)
 	}
 	t.Cleanup(func() { db.Close() })
-	return New(db)
+	return New(db, 5)
 }
 func pair(t *testing.T, s *State, k keys) protocol.Credentials {
 	t.Helper()
@@ -112,7 +112,7 @@ func TestWakeKeyCannotGrantManagementAndConsumesChallenge(t *testing.T) {
 	s := state(t)
 	k := newKeys(t)
 	creds := pair(t, s, k)
-	origin := "https://wol.hubu.wiki"
+	origin := "https://wol.example"
 	c, e := s.ManageChallenge(creds.DeviceID, origin, 10, false)
 	if e != nil {
 		t.Fatal(e)
@@ -181,7 +181,7 @@ func TestTicketOriginReplayAndSessionReplacement(t *testing.T) {
 	s := state(t)
 	k := newKeys(t)
 	creds := pair(t, s, k)
-	a, b := "https://wol.hubu.wiki", "https://roc.hubu.wiki"
+	a, b := "https://wol.example", "https://backup.example"
 	tk := ticket(t, s, k, creds.DeviceID, a)
 	_, _, e := s.Redeem(tk, b)
 	wantFailure(t, e, 403)
@@ -230,7 +230,7 @@ func TestRevokeInvalidatesEveryGrantAndActiveProxy(t *testing.T) {
 	creds := pair(t, s, k)
 	otherK := newKeys(t)
 	other := pair(t, s, otherK)
-	origin := "https://wol.hubu.wiki"
+	origin := "https://wol.example"
 	cookie, _, e := s.Redeem(ticket(t, s, k, creds.DeviceID, origin), origin)
 	if e != nil {
 		t.Fatal(e)

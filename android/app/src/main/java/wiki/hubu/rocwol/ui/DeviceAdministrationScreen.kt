@@ -1,6 +1,7 @@
 package wiki.hubu.rocwol.ui
 
 import android.app.Activity
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -48,6 +49,7 @@ import wiki.hubu.rocwol.data.ApiException
 import wiki.hubu.rocwol.data.DeviceAdministration
 import wiki.hubu.rocwol.data.DeviceAdministrationAccess
 import wiki.hubu.rocwol.data.Repository
+import wiki.hubu.rocwol.reminders.AuthorizationReminders
 import wiki.hubu.rocwol.data.administrationFailureOutcome
 import wiki.hubu.rocwol.data.journal.JournalOutcome
 import wiki.hubu.rocwol.security.AuthenticationCancelled
@@ -57,17 +59,19 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 
 @Composable
-fun DeviceAdministrationScreen(activity: Activity, repository: Repository, onIdentityRevoked: () -> Unit, onBack: () -> Unit) {
+fun DeviceAdministrationScreen(activity: Activity, repository: Repository, onIdentityRevoked: () -> Unit, onSwitchLock: (Boolean) -> Unit, onBack: () -> Unit) {
     val administration = remember(repository) { DeviceAdministration(repository) }
     val scope = rememberCoroutineScope()
     val identityRevoked by rememberUpdatedState(onIdentityRevoked)
     var access by remember(repository) { mutableStateOf<DeviceAdministrationAccess?>(null) }
     var devices by remember(repository) { mutableStateOf<List<AdministeredDevice>?>(null) }
+    var capacity by remember(repository) { mutableStateOf<Int?>(null) }
     var busy by remember { mutableStateOf(true) }
     var message by remember { mutableStateOf<String?>(null) }
     var error by remember { mutableStateOf(false) }
     var confirmation by remember { mutableStateOf<AdministeredDevice?>(null) }
     val dateFormat = remember { DateTimeFormatter.ofPattern("yyyy年M月d日 HH:mm").withZone(ZoneId.systemDefault()) }
+    BackHandler { if (!busy) onBack() }
 
     suspend fun handleFailure(failure: Exception, revoking: Boolean = false) {
         if (failure is CancellationException) throw failure
@@ -77,7 +81,10 @@ fun DeviceAdministrationScreen(activity: Activity, repository: Repository, onIde
             is AuthenticationUnavailable -> "系统验证暂不可用。请检查锁屏密码或生物识别设置，再手动重试。"
             is IdentityLost -> {
                 devices = null
-                repository.forgetIdentity()
+                withContext(NonCancellable) {
+                    repository.forgetIdentity()
+                    AuthorizationReminders.get(activity).clear(repository.profileId)
+                }
                 identityRevoked()
                 "此手机身份已失效，请重新配对。"
             }
@@ -110,7 +117,7 @@ fun DeviceAdministrationScreen(activity: Activity, repository: Repository, onIde
         busy = true
         message = null
         error = false
-        try { access = administration.access() }
+        try { access = repository.withOperation(readOnly = true) { administration.access() } }
         catch (failure: Exception) { handleFailure(failure) }
         finally { busy = false }
     }
@@ -124,8 +131,8 @@ fun DeviceAdministrationScreen(activity: Activity, repository: Repository, onIde
                 verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    TextButton(onClick = onBack) { Text("返回") }
-                    Text("已配对设备", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.semantics { heading() })
+                    TextButton(onClick = onBack, enabled = !busy) { Text("返回") }
+                    Text("已配对设备 · ${repository.profile.displayName}", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.semantics { heading() })
                 }
                 Text("设备管理是独立权限，与唤醒权限、路由器管理授权分开。查看列表和每次撤销都需要系统验证。",
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -156,20 +163,23 @@ fun DeviceAdministrationScreen(activity: Activity, repository: Repository, onIde
                     }
                     true -> {
                         Button(enabled = !busy, onClick = {
+                            onSwitchLock(true)
                             scope.launch {
                                 busy = true
                                 message = null
                                 error = false
                                 try {
-                                    devices = administration.list(activity)
+                                    val result = repository.withOperation { administration.list(activity) }
+                                    devices = result.devices
+                                    capacity = result.capacity
                                     message = "已验证并更新设备列表。"
                                 } catch (failure: Exception) { handleFailure(failure) }
-                                finally { busy = false }
+                                finally { busy = false; onSwitchLock(false) }
                             }
                         }) { Text(if (devices == null) "验证并查看设备" else "验证并刷新列表") }
                         if (devices == null) Text("点击上方按钮开始系统验证。不会自动弹出或反复请求验证。", color = MaterialTheme.colorScheme.onSurfaceVariant)
                         devices?.let { list ->
-                            Text("有效设备 ${list.size} / 5", style = MaterialTheme.typography.titleMedium)
+                            Text("有效设备 ${list.size} / ${capacity ?: "未知"}", style = MaterialTheme.typography.titleMedium)
                             list.forEach { device ->
                                 Card(Modifier.fillMaxWidth()) {
                                     Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -209,18 +219,19 @@ fun DeviceAdministrationScreen(activity: Activity, repository: Repository, onIde
             confirmButton = {
                 TextButton(colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error), onClick = {
                     confirmation = null
+                    onSwitchLock(true)
                     scope.launch {
                         var selfRevoked = false
                         busy = true
                         message = null
                         error = false
                         try {
-                            val result = administration.revoke(activity, target)
+                            val result = repository.withOperation { administration.revoke(activity, target) }
                             if (result.current) {
                                 selfRevoked = true
                                 withContext(NonCancellable) {
-                                    try { repository.forgetIdentity() }
-                                    finally { identityRevoked() }
+                                    repository.forgetIdentity()
+                                    identityRevoked()
                                 }
                             } else {
                                 devices = devices?.filterNot { it.deviceId == result.deviceId }
@@ -233,7 +244,7 @@ fun DeviceAdministrationScreen(activity: Activity, repository: Repository, onIde
                                 message = "此手机已在服务器撤销，本地身份清理未完成。请重新打开应用并清除本机身份。"
                             } else handleFailure(failure, revoking = true)
                         }
-                        finally { busy = false }
+                        finally { busy = false; onSwitchLock(false) }
                     }
                 }) { Text("验证并撤销") }
             },

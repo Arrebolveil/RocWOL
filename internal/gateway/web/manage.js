@@ -8,7 +8,7 @@ async function redeem() {
   const ticket = params.get("t");
   if (!ticket || !/^[A-Za-z0-9_-]{43}$/.test(ticket) || params.size !== 1) { fail(); return; }
   try {
-    const response = await fetch("/_wol/v1/manage/redeem", {
+    const response = await fetch("/_wol/v2/manage/redeem", {
       method: "POST", credentials: "same-origin", cache: "no-store", redirect: "error",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ticket }), signal: AbortSignal.timeout(10000)

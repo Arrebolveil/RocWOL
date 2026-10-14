@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"unicode"
 
 	"hubu.wiki/roc-wol/internal/protocol"
 )
@@ -59,24 +60,17 @@ func (g *Gateway) makeProxy(tr http.RoundTripper) *httputil.ReverseProxy {
 				resp.Header.Add("Set-Cookie", c.String())
 			}
 			if location := resp.Header.Get("Location"); location != "" {
+				if len(resp.Header.Values("Location")) != 1 {
+					return errors.New("ambiguous upstream redirect")
+				}
 				u, e := url.Parse(location)
-				if e != nil || strings.ContainsAny(location, "\\\r\n\t") || strings.TrimSpace(location) != location || strings.HasPrefix(location, "//") {
+				if e != nil || !safeLocation(location, u) {
 					return errors.New("invalid upstream redirect")
 				}
 				origin, _ := resp.Request.Context().Value(originKey{}).(string)
 				if u.IsAbs() || u.Host != "" {
-					public, _ := url.Parse(origin)
-					if u.User != nil {
-						return errors.New("upstream redirect userinfo refused")
-					}
-					if u.Scheme == public.Scheme && u.Host == public.Host {
-						// A same-origin absolute redirect is already safe; only the known
-						// internal LuCI origin below may be rewritten.
-					} else if u.Scheme == "http" && (u.Host == "127.0.0.1:80" || u.Host == "127.0.0.1") {
-						u.Scheme = public.Scheme
-						u.Host = public.Host
-						resp.Header.Set("Location", u.String())
-					} else {
+					normalized, err := protocol.NormalizeOrigin(u.Scheme + "://" + u.Host)
+					if err != nil || normalized != origin {
 						return errors.New("external upstream redirect refused")
 					}
 				}
@@ -100,4 +94,28 @@ func (g *Gateway) makeProxy(tr http.RoundTripper) *httputil.ReverseProxy {
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, e error) { protocol.Fail(w, 503, "upstream_unavailable") },
 	}
+}
+
+func safeLocation(location string, u *url.URL) bool {
+	if u.User != nil || u.Opaque != "" || strings.ContainsAny(location, "\\") || strings.HasPrefix(location, "//") {
+		return false
+	}
+	for _, c := range location {
+		if unicode.IsSpace(c) || unicode.IsControl(c) {
+			return false
+		}
+	}
+	decoded, err := url.PathUnescape(location)
+	if err != nil || strings.ContainsAny(decoded, "\\") || strings.HasPrefix(decoded, "//") {
+		return false
+	}
+	for _, c := range decoded {
+		if unicode.IsControl(c) {
+			return false
+		}
+	}
+	if !u.IsAbs() && u.Host != "" {
+		return false
+	}
+	return true
 }

@@ -8,21 +8,23 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
+	"strconv"
 
 	"hubu.wiki/roc-wol/internal/protocol"
 )
 
 type Config struct {
-	Listen          string   `json:"listen"`
-	PublicOrigins   []string `json:"publicOrigins"`
-	AgentURL        string   `json:"agentURL"`
-	AgentServerName string   `json:"agentServerName"`
-	CAFile          string   `json:"caFile"`
-	ClientCertFile  string   `json:"clientCertFile"`
-	ClientKeyFile   string   `json:"clientKeyFile"`
-	DataFile        string   `json:"dataFile"`
-	AdminSocket     string   `json:"adminSocket"`
+	Listen            string   `json:"listen"`
+	PublicOrigins     []string `json:"publicOrigins"`
+	AgentURL          string   `json:"agentURL"`
+	AgentServerName   string   `json:"agentServerName"`
+	CAFile            string   `json:"caFile"`
+	ClientCertFile    string   `json:"clientCertFile"`
+	ClientKeyFile     string   `json:"clientKeyFile"`
+	DataFile          string   `json:"dataFile"`
+	AdminSocket       string   `json:"adminSocket"`
+	MaxDevices        int      `json:"maxDevices"`
+	ManagementEnabled *bool    `json:"managementEnabled"`
 }
 
 func LoadConfig(path string) (Config, error) {
@@ -35,27 +37,43 @@ func LoadConfig(path string) (Config, error) {
 	if e = protocol.DecodeJSON(f, &c, 64<<10); e != nil {
 		return c, e
 	}
-	return c, c.Validate()
+	if e = c.Validate(); e != nil {
+		return c, e
+	}
+	return c, nil
 }
-func (c Config) Validate() error {
+func (c *Config) Validate() error {
 	host, port, e := net.SplitHostPort(c.Listen)
 	ip := net.ParseIP(host)
-	if e != nil || ip == nil || !ip.IsLoopback() || port == "" || port == "0" {
+	n, portErr := strconv.Atoi(port)
+	if e != nil || ip == nil || !ip.IsLoopback() || portErr != nil || n < 1 || n > 65535 {
 		return errors.New("listen must be a loopback address with a nonzero port")
 	}
-	if len(c.PublicOrigins) == 0 {
-		return errors.New("publicOrigins is required")
+	if len(c.PublicOrigins) < 1 || len(c.PublicOrigins) > 8 {
+		return errors.New("publicOrigins must contain 1–8 origins")
 	}
 	seen := map[string]bool{}
-	for _, origin := range c.PublicOrigins {
-		u, e := url.Parse(origin)
-		if e != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.Port() != "" || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.Host != strings.ToLower(u.Host) || seen[origin] {
+	for i, origin := range c.PublicOrigins {
+		normalized, e := protocol.NormalizeOrigin(origin)
+		if e != nil || seen[normalized] {
 			return errors.New("publicOrigins must contain unique HTTPS origins")
 		}
-		seen[origin] = true
+		c.PublicOrigins[i] = normalized
+		seen[normalized] = true
+	}
+	if c.MaxDevices == 0 {
+		c.MaxDevices = 5
+	}
+	if c.MaxDevices < 1 || c.MaxDevices > 100 {
+		return errors.New("maxDevices must be between 1 and 100")
 	}
 	u, e := url.Parse(c.AgentURL)
-	if e != nil || u.Scheme != "https" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || net.ParseIP(u.Hostname()) == nil || !net.ParseIP(u.Hostname()).IsLoopback() || u.Port() == "" {
+	if e != nil {
+		return errors.New("agentURL must be a loopback HTTPS origin with explicit port")
+	}
+	_, normalizeErr := protocol.NormalizeOrigin(c.AgentURL)
+	agentPort, agentPortErr := strconv.Atoi(u.Port())
+	if normalizeErr != nil || u.Scheme != "https" || u.Path != "" || net.ParseIP(u.Hostname()) == nil || !net.ParseIP(u.Hostname()).IsLoopback() || agentPortErr != nil || agentPort < 1 || agentPort > 65535 {
 		return errors.New("agentURL must be a loopback HTTPS origin with explicit port")
 	}
 	if c.AgentServerName != "router.roc-wol.internal" {

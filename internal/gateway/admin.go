@@ -1,6 +1,8 @@
 package gateway
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"net"
 	"net/http"
@@ -69,7 +71,14 @@ func (g *Gateway) admin(w http.ResponseWriter, r *http.Request) {
 		}
 		out := make([]map[string]any, 0, len(devices))
 		for _, d := range devices {
-			out = append(out, map[string]any{"deviceId": d.DeviceID, "deviceName": d.DeviceName, "createdAt": d.CreatedAt, "revoked": d.Revoked, "deviceAdministration": d.DeviceAdministration})
+			wakeDER, wakeErr := protocol.Decode(d.WakeKey)
+			manageDER, manageErr := protocol.Decode(d.ManageKey)
+			if wakeErr != nil || manageErr != nil {
+				protocol.Fail(w, 503, "upstream_unavailable")
+				return
+			}
+			wakeHash, manageHash := sha256.Sum256(wakeDER), sha256.Sum256(manageDER)
+			out = append(out, map[string]any{"deviceId": d.DeviceID, "deviceName": d.DeviceName, "createdAt": d.CreatedAt, "revoked": d.Revoked, "deviceAdministration": d.DeviceAdministration, "wakeKeySHA256": hex.EncodeToString(wakeHash[:]), "manageKeySHA256": hex.EncodeToString(manageHash[:])})
 		}
 		protocol.JSON(w, 200, out)
 	case r.Method == "POST" && r.URL.Path == "/devices/revoke":

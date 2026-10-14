@@ -9,6 +9,9 @@ import androidx.room.PrimaryKey
 import androidx.room.Query
 import androidx.room.RoomDatabase
 import kotlinx.coroutines.flow.Flow
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
+import wiki.hubu.rocwol.data.OperationContext
 import java.time.Instant
 
 @Entity(tableName = "operation_events", indices = [Index("timestampMs"), Index("scopeKey")])
@@ -32,29 +35,36 @@ internal data class StoredEvent(
     val scopeKey: String,
     val fingerprint: String,
     @androidx.room.ColumnInfo(defaultValue = "1") val occurrences: Int = 1,
-    @androidx.room.ColumnInfo(defaultValue = "0") val lastTimestampMs: Long = 0
+    @androidx.room.ColumnInfo(defaultValue = "0") val lastTimestampMs: Long = 0,
+    val profileId: String? = null,
+    val targetId: String? = null,
+    val routeIndex: Int? = null
 ) {
     fun record(): JournalRecord? = runCatching {
+        if (profileId == null && (targetId != null || routeIndex != null)) return null
         val event = JournalEvent(
             action = JournalAction.valueOf(action), outcome = JournalOutcome.valueOf(outcome),
-            trigger = JournalTrigger.valueOf(trigger), origin = origin, requestId = requestId,
-            httpStatus = httpStatus, error = error?.let(JournalError::valueOf), durationMs = durationMs,
-            wakeStage = wakeStage?.let(WakeStage::valueOf), target = target?.let(JournalTarget::valueOf),
+            trigger = JournalTrigger.valueOf(trigger),
+            context = profileId?.let { OperationContext(it, "", targetId = targetId, routeIndex = routeIndex) },
+            requestId = requestId,
+            httpStatus = httpStatus, error = error?.let { value -> JournalError.entries.firstOrNull { it.name == value } ?: JournalError.OTHER },
+            durationMs = durationMs, wakeStage = wakeStage?.let(WakeStage::valueOf),
             reachability = reachability?.let(JournalReachability::valueOf), router = router?.let(JournalRouter::valueOf),
             authorizationMinutes = authorizationMinutes, allowAllDevices = allowAllDevices
         )
         if (!event.isSafe() || occurrences !in 1..1_000_000) return null
-        JournalRecord(id, Instant.ofEpochMilli(timestampMs), Instant.ofEpochMilli(lastTimestampMs), occurrences, event)
+        JournalRecord(id, Instant.ofEpochMilli(timestampMs), Instant.ofEpochMilli(lastTimestampMs), occurrences, event, legacyOrigin = origin)
     }.getOrNull()
 
     companion object {
         fun from(event: JournalEvent, now: Long) = StoredEvent(
             timestampMs = now, action = event.action.name, outcome = event.outcome.name, trigger = event.trigger.name,
-            origin = event.origin, requestId = event.requestId, httpStatus = event.httpStatus, error = event.error?.name,
-            durationMs = event.durationMs, wakeStage = event.wakeStage?.name, target = event.target?.name,
+            origin = null, requestId = event.requestId, httpStatus = event.httpStatus, error = event.error?.name,
+            durationMs = event.durationMs, wakeStage = event.wakeStage?.name, target = null,
             reachability = event.reachability?.name, router = event.router?.name,
             authorizationMinutes = event.authorizationMinutes, allowAllDevices = event.allowAllDevices,
-            scopeKey = event.scopeKey(), fingerprint = event.fingerprint(), lastTimestampMs = now
+            scopeKey = event.scopeKey(), fingerprint = event.fingerprint(), lastTimestampMs = now,
+            profileId = event.context?.profileId, targetId = event.context?.targetId, routeIndex = event.context?.routeIndex
         )
     }
 }
@@ -85,7 +95,27 @@ internal interface JournalDao {
     suspend fun clear()
 }
 
-@Database(entities = [StoredEvent::class], version = 1, exportSchema = true)
+@Database(entities = [StoredEvent::class], version = 2, exportSchema = true)
 internal abstract class JournalDatabase : RoomDatabase() {
     abstract fun events(): JournalDao
+
+    companion object {
+        /** Keep every v1 row and its legacy columns; never destructively recreate the log. */
+        val MIGRATION_1_2 = object : Migration(1, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE operation_events ADD COLUMN profileId TEXT")
+                db.execSQL("ALTER TABLE operation_events ADD COLUMN targetId TEXT")
+                db.execSQL("ALTER TABLE operation_events ADD COLUMN routeIndex INTEGER")
+                db.execSQL(
+                    "UPDATE operation_events SET profileId = ? WHERE (origin IS NOT NULL AND origin != '') OR target = 'DESKTOP'",
+                    arrayOf(LEGACY_JOURNAL_PROFILE_ID)
+                )
+                db.execSQL("UPDATE operation_events SET targetId = 'desktop' WHERE target = 'DESKTOP'")
+                db.execSQL(
+                    "UPDATE operation_events SET scopeKey = action || '|' || COALESCE(profileId, '') || '|' || " +
+                        "COALESCE(targetId, '') || '||' || COALESCE(requestId, '')"
+                )
+            }
+        }
+    }
 }

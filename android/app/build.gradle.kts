@@ -1,4 +1,5 @@
 import java.io.File
+import java.net.URI
 
 plugins {
     id("com.android.application")
@@ -16,20 +17,23 @@ val keyPasswordFile = signingFile("rocwol.keyPasswordFile", "ROCWOL_KEY_PASSWORD
 val signingReady = releaseStore.isFile && storePasswordFile.isFile && keyPasswordFile.isFile
 
 android {
-val directOrigin = providers.gradleProperty("rocwol.directOrigin").orElse("https://wol.hubu.wiki").get()
-val fallbackOrigin = providers.gradleProperty("rocwol.fallbackOrigin").orElse("https://roc.hubu.wiki").get()
-require(directOrigin in setOf("https://wol.hubu.wiki", "https://wol-direct.hubu.wiki"))
-require(fallbackOrigin == "https://roc.hubu.wiki")
+    val releasesUrl = providers.gradleProperty("rocwol.releasesUrl")
+        .orElse("https://github.com/Arrebolveil/RocWOL/releases").get()
+    require(releasesUrl.isEmpty() || runCatching {
+        val uri = URI(releasesUrl)
+        uri.scheme == "https" && !uri.host.isNullOrEmpty() && uri.rawUserInfo == null &&
+            releasesUrl.none { it.isISOControl() } && !releasesUrl.contains('\\')
+    }.getOrDefault(false)) { "rocwol.releasesUrl must be an HTTPS URL or empty" }
     namespace = "wiki.hubu.rocwol"
     compileSdk = 36
     defaultConfig {
         applicationId = "wiki.hubu.rocwol"
         minSdk = 30
         targetSdk = 36
-        versionCode = 7
-        versionName = "1.4.0"
-        buildConfigField("String", "DIRECT_ORIGIN", "\"$directOrigin\"")
-        buildConfigField("String", "FALLBACK_ORIGIN", "\"$fallbackOrigin\"")
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        versionCode = 8
+        versionName = "2.0.0"
+        buildConfigField("String", "RELEASES_URL", "\"${releasesUrl.replace("\"", "\\\"")}\"")
     }
     signingConfigs {
         create("release") {
@@ -81,6 +85,8 @@ dependencies {
     ksp("androidx.room:room-compiler:2.8.4")
     implementation("androidx.work:work-runtime-ktx:2.10.1")
     testImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.test.ext:junit:1.3.0")
+    androidTestImplementation("androidx.test:runner:1.7.0")
 }
 
 ksp {

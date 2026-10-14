@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"hubu.wiki/roc-wol/internal/gateway"
+	"hubu.wiki/roc-wol/internal/protocol"
 )
 
 const usage = `roc-wol — authenticated remote wake gateway
@@ -148,9 +149,12 @@ func admin(socket, method, path string, payload any) ([]byte, error) {
 		return nil, e
 	}
 	defer resp.Body.Close()
-	data, e := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	data, e := io.ReadAll(io.LimitReader(resp.Body, protocol.ResponseJSONLimit+1))
 	if e != nil {
 		return nil, e
+	}
+	if len(data) > protocol.ResponseJSONLimit {
+		return nil, errors.New("administration response exceeds 64 KiB")
 	}
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("administration request failed (HTTP %d)", resp.StatusCode)

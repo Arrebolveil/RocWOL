@@ -49,65 +49,90 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import wiki.hubu.rocwol.data.ConnectionDiagnostics
 import wiki.hubu.rocwol.data.DiagnosticDetail
-import wiki.hubu.rocwol.data.DiagnosticOrigin
 import wiki.hubu.rocwol.data.DiagnosticOutcome
 import wiki.hubu.rocwol.data.DiagnosticReport
 import wiki.hubu.rocwol.data.DiagnosticStage
 import wiki.hubu.rocwol.data.DiagnosticStageResult
 import wiki.hubu.rocwol.data.Target
+import wiki.hubu.rocwol.data.Repository
+import wiki.hubu.rocwol.data.OperationContext
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.withContext
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 
 @Composable
 fun DiagnosticsScreen(
-    origin: String,
-    loadTarget: suspend () -> Target,
+    repository: Repository,
+    operationContext: OperationContext,
     onResult: (DiagnosticReport) -> Unit,
     onBack: () -> Unit
 ) {
-    key(origin) { DiagnosticsContent(origin, loadTarget, onResult, onBack) }
+    key(operationContext.profileId, operationContext.targetId, operationContext.origin) {
+        DiagnosticsContent(repository, operationContext, onResult, onBack)
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun DiagnosticsContent(
-    origin: String,
-    loadTarget: suspend () -> Target,
+    repository: Repository,
+    operationContext: OperationContext,
     onResult: (DiagnosticReport) -> Unit,
     onBack: () -> Unit
 ) {
     val context = LocalContext.current
+    val origin = operationContext.origin
+    val routeIndex = requireNotNull(operationContext.routeIndex)
+    val loadTarget: suspend () -> Target = {
+        repository.withOperation(readOnly = true) {
+            repository.target(requireNotNull(operationContext.targetId), requestOrigin = origin)
+        }
+    }
     val diagnostics = remember(context) { ConnectionDiagnostics.get(context) }
     val scope = rememberCoroutineScope()
     val currentOnResult by rememberUpdatedState(onResult)
-    var report by remember { mutableStateOf(DiagnosticReport.pending(origin)) }
+    var report by remember { mutableStateOf(DiagnosticReport.pending(routeIndex)) }
     var activeJob by remember { mutableStateOf<Job?>(null) }
     var running by remember { mutableStateOf(false) }
     var generation by remember { mutableIntStateOf(0) }
     var started by remember { mutableStateOf(0L) }
+    var finishing by remember { mutableStateOf(false) }
     DisposableEffect(Unit) {
         onDispose {
             generation++
             activeJob?.cancel()
+            CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate).launch {
+                diagnostics.cancelAndJoin()
+            }
         }
     }
-    fun cancel(publish: Boolean) {
-        if (!running) return
+    fun cancel(publish: Boolean, leave: Boolean = false) {
+        if (finishing) return
         generation++
-        activeJob?.cancel()
-        activeJob = null
-        running = false
-        report = report.canceled(SystemClock.elapsedRealtime() - started)
-        if (publish) currentOnResult(report)
+        finishing = true
+        scope.launch {
+            withContext(NonCancellable) {
+                activeJob?.cancelAndJoin()
+                diagnostics.cancelAndJoin()
+            }
+            activeJob = null
+            running = false
+            finishing = false
+            report = report.canceled(SystemClock.elapsedRealtime() - started)
+            if (publish) currentOnResult(report)
+            if (leave) onBack()
+        }
     }
-    fun leave() {
-        cancel(publish = false)
-        onBack()
-    }
+    fun leave() { cancel(publish = false, leave = true) }
     BackHandler { leave() }
     Scaffold(
         topBar = {
-            TopAppBar(title = { Text("连接诊断") }, navigationIcon = {
+            TopAppBar(title = { Text("连接诊断 · ${repository.profile.displayName}") }, navigationIcon = {
                 IconButton(onClick = { leave() }) {
                     Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
                 }
@@ -122,7 +147,7 @@ private fun DiagnosticsContent(
             ) {
                 item {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("本机诊断 · ${if (report.origin == DiagnosticOrigin.DIRECT) "直连线路" else "备用线路"}", style = MaterialTheme.typography.titleLarge)
+                        Text("本机诊断 · 线路 ${report.routeIndex}", style = MaterialTheme.typography.titleLarge)
                         Text("仅按需进行系统 DNS 解析与一次已认证的缓存目标查询；可能需要刷新登录令牌。不会发送唤醒包、绕过 VPN、切换线路或强制刷新目标探测。", style = MaterialTheme.typography.bodyMedium)
                         Text("HTTPS 是否收到响应由该查询判断，不单独探测；API 耗时包含必要的认证。路由器和电脑状态来自服务器缓存，不是手机直连探测，也不能据此确定 frpc 故障或电脑已关机。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
@@ -130,7 +155,7 @@ private fun DiagnosticsContent(
                 item {
                     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         Text(
-                            if (running) "正在检查，最多约 25 秒…" else if (report.finished) "本次检查已结束 · ${report.elapsedMs} 毫秒" else "点击开始检查；需要已配对的手机身份。",
+                            if (finishing) "正在结束检查…" else if (running) "正在检查，最多约 25 秒…" else if (report.finished) "本次检查已结束 · ${report.elapsedMs} 毫秒" else "点击开始检查；需要已配对的手机身份。",
                             style = MaterialTheme.typography.bodyMedium,
                             modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite }
                         )
@@ -140,11 +165,11 @@ private fun DiagnosticsContent(
                                 val check = ++generation
                                 val capturedLoadTarget = loadTarget
                                 started = SystemClock.elapsedRealtime()
-                                report = DiagnosticReport.pending(origin)
+                                report = DiagnosticReport.pending(routeIndex)
                                 running = true
                                 activeJob = scope.launch {
                                     try {
-                                        val completed = diagnostics.run(origin, capturedLoadTarget) {
+                                        val completed = diagnostics.run(origin, routeIndex, capturedLoadTarget) {
                                             if (generation == check) report = it
                                         }
                                         if (generation == check) {
@@ -164,10 +189,10 @@ private fun DiagnosticsContent(
                                     }
                                 }
                             },
-                            enabled = !running,
+                            enabled = !running && !finishing,
                             modifier = Modifier.fillMaxWidth()
                         ) { Text(if (report.finished) "重新检查" else "开始检查") }
-                        if (running) OutlinedButton(onClick = { cancel(publish = true) }, modifier = Modifier.fillMaxWidth()) { Text("取消检查") }
+                        if (running) OutlinedButton(enabled = !finishing, onClick = { cancel(publish = true) }, modifier = Modifier.fillMaxWidth()) { Text("取消检查") }
                     }
                 }
                 items(report.stages, key = { it.stage }) { result -> DiagnosticStageCard(result) }

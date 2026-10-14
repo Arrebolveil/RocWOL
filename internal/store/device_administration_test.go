@@ -28,7 +28,7 @@ func TestDeviceAdministrationDefaultsDenyAndPersistsExplicitChoice(t *testing.T)
 	if e = s.AddCode(code, now.Add(time.Minute)); e != nil {
 		t.Fatal(e)
 	}
-	if e = s.Register(code, Device{DeviceID: id, DeviceName: "phone", CreatedAt: now, DeviceAdministration: true}, now); e != nil {
+	if e = s.Register(code, Device{DeviceID: id, DeviceName: "phone", CreatedAt: now, DeviceAdministration: true}, now, 5); e != nil {
 		t.Fatal(e)
 	}
 	d, e := s.Device(id)

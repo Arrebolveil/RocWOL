@@ -15,6 +15,10 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import java.net.InetAddress
 import java.net.URI
@@ -23,7 +27,6 @@ import kotlin.coroutines.resume
 import wiki.hubu.rocwol.security.IdentityLost
 
 // Reports deliberately contain no hostnames, addresses, credentials, or exception messages.
-enum class DiagnosticOrigin { DIRECT, FALLBACK }
 enum class DiagnosticStage { DNS, HTTPS, API, ROUTER, TARGET }
 enum class DiagnosticOutcome { NOT_RUN, RUNNING, SUCCESS, FAILURE, UNKNOWN, SKIPPED, CANCELED }
 enum class DiagnosticDetail {
@@ -44,7 +47,7 @@ data class DiagnosticStageResult(
 )
 
 data class DiagnosticReport(
-    val origin: DiagnosticOrigin,
+    val routeIndex: Int,
     val startedAt: Instant,
     val stages: List<DiagnosticStageResult>,
     val elapsedMs: Long = 0,
@@ -63,11 +66,10 @@ data class DiagnosticReport(
     )
 
     companion object {
-        fun pending(origin: String): DiagnosticReport {
-            Origins.checked(origin)
+        fun pending(routeIndex: Int): DiagnosticReport {
+            require(routeIndex > 0)
             return DiagnosticReport(
-                if (origin == Origins.all.first()) DiagnosticOrigin.DIRECT else DiagnosticOrigin.FALLBACK,
-                Instant.now(), DiagnosticStage.entries.map { DiagnosticStageResult(it) }
+                routeIndex, Instant.now(), DiagnosticStage.entries.map { DiagnosticStageResult(it) }
             )
         }
     }
@@ -77,16 +79,26 @@ class ConnectionDiagnostics private constructor(context: Context) {
     private val callbackExecutor = context.applicationContext.mainExecutor
     private val workerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val queryGate = Mutex()
+    @Volatile private var activeWorker: Job? = null
+    @Volatile private var activeRun: Job? = null
+
+    suspend fun cancelAndJoin() {
+        withContext(NonCancellable) {
+            activeRun?.cancelAndJoin()
+            activeWorker?.cancelAndJoin()
+        }
+    }
 
     /** One system DNS lookup, then one authenticated cached target query. Never sends WOL. */
     suspend fun run(
         origin: String,
+        routeIndex: Int,
         loadTarget: suspend () -> Target,
         onProgress: (DiagnosticReport) -> Unit = {}
     ): DiagnosticReport {
         val host = requireNotNull(URI(Origins.checked(origin)).host)
         val started = SystemClock.elapsedRealtime()
-        var report = DiagnosticReport.pending(origin)
+        var report = DiagnosticReport.pending(routeIndex)
         fun publish() {
             report = report.copy(elapsedMs = SystemClock.elapsedRealtime() - started)
             onProgress(report)
@@ -115,6 +127,8 @@ class ConnectionDiagnostics private constructor(context: Context) {
             return finish()
         }
         var workerOwnsGate = false
+        val runJob = currentCoroutineContext()[Job]
+        activeRun = runJob
         try {
             currentCoroutineContext().ensureActive()
             stage(DiagnosticStage.DNS, DiagnosticOutcome.RUNNING, DiagnosticDetail.CHECKING)
@@ -140,10 +154,14 @@ class ConnectionDiagnostics private constructor(context: Context) {
             stage(DiagnosticStage.API, DiagnosticOutcome.RUNNING, DiagnosticDetail.CHECKING)
             publish()
             val apiStarted = SystemClock.elapsedRealtime()
-            // Detached only so a blocking platform socket cannot delay screen disposal. The gate
-            // remains held until it actually exits; cancellation cannot create overlapping retries.
+            // Track the actual blocking HTTP worker, not just the screen job. The gate remains
+            // held through socket cleanup, and cancelAndJoin waits for that cleanup before switching.
             val worker = workerScope.async(start = CoroutineStart.LAZY) { loadTarget() }
-            worker.invokeOnCompletion { queryGate.unlock() }
+            activeWorker = worker
+            worker.invokeOnCompletion {
+                queryGate.unlock()
+                if (activeWorker === worker) activeWorker = null
+            }
             workerOwnsGate = true
             try {
                 val target = withTimeout(20_000) { worker.await() }
@@ -202,6 +220,7 @@ class ConnectionDiagnostics private constructor(context: Context) {
             return finish()
         } finally {
             if (!workerOwnsGate) queryGate.unlock()
+            if (activeRun === runJob) activeRun = null
         }
     }
 

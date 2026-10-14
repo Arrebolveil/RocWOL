@@ -13,7 +13,7 @@ func TestEndManagementClosesOnlyOwnersManagement(t *testing.T) {
 	s := state(t)
 	k, otherKeys := newKeys(t), newKeys(t)
 	owner, other := pair(t, s, k), pair(t, s, otherKeys)
-	a := "https://wol.hubu.wiki"
+	a := "https://wol.example"
 	cookie, _, err := s.Redeem(ticket(t, s, k, owner.DeviceID, a), a)
 	if err != nil {
 		t.Fatal(err)
@@ -76,7 +76,7 @@ func TestManagementDurationBoundToChallengeAndExpiresAtBoundary(t *testing.T) {
 	s := state(t)
 	k := newKeys(t)
 	owner := pair(t, s, k)
-	origin := "https://wol.hubu.wiki"
+	origin := "https://wol.example"
 	start := s.now()
 	now := start
 	s.now = func() time.Time { return now }
@@ -151,7 +151,7 @@ func TestManagementSignatureBindsDurationScopeAndOrigin(t *testing.T) {
 			s := state(t)
 			k := newKeys(t)
 			owner := pair(t, s, k)
-			origin := "https://wol.hubu.wiki"
+			origin := "https://wol.example"
 			c, err := s.ManageChallenge(owner.DeviceID, origin, 10, false)
 			if err != nil {
 				t.Fatal(err)
@@ -163,7 +163,7 @@ func TestManagementSignatureBindsDurationScopeAndOrigin(t *testing.T) {
 			case "scope":
 				all = true
 			case "origin":
-				signedOrigin = "https://roc.hubu.wiki"
+				signedOrigin = "https://backup.example"
 			}
 			msg := protocol.ManageMessage(owner.DeviceID, c.ChallengeID, c.Nonce, signedOrigin, minutes, all)
 			_, err = s.AuthorizeManagement(owner.DeviceID, c.ChallengeID, sign(t, k.manage, msg), origin)
@@ -180,7 +180,7 @@ func TestAnonymousAccessRequiresOptInAndExactOrigin(t *testing.T) {
 	s := state(t)
 	k := newKeys(t)
 	owner := pair(t, s, k)
-	a, b := "https://wol.hubu.wiki", "https://roc.hubu.wiki"
+	a, b := "https://wol.example", "https://backup.example"
 	_, err := s.ManagementBrowser(owner.DeviceID, a)
 	wantFailure(t, err, 403)
 	authorize(t, s, k, owner.DeviceID, a, 10, false)
@@ -204,7 +204,7 @@ func TestAnonymousRequestsCloseOnEndRevokeAndReplacement(t *testing.T) {
 			s := state(t)
 			k, otherK := newKeys(t), newKeys(t)
 			owner, other := pair(t, s, k), pair(t, s, otherK)
-			a, b := "https://wol.hubu.wiki", "https://roc.hubu.wiki"
+			a, b := "https://wol.example", "https://backup.example"
 			authorize(t, s, k, owner.DeviceID, a, 10, true)
 			authorize(t, s, otherK, other.DeviceID, b, 10, true)
 			ctx, release, err := s.ProxyContext(context.Background(), "", a)
@@ -252,7 +252,7 @@ func TestBrowserTicketReplacementAndRateLimit(t *testing.T) {
 	s := state(t)
 	k := newKeys(t)
 	owner := pair(t, s, k)
-	origin := "https://wol.hubu.wiki"
+	origin := "https://wol.example"
 	grant := authorize(t, s, k, owner.DeviceID, origin, 10, false)
 	stale := browserTicket(t, s, owner.DeviceID, origin)
 	fresh := browserTicket(t, s, owner.DeviceID, origin)
@@ -279,7 +279,7 @@ func TestPermanentManagementLifecycle(t *testing.T) {
 			s := state(t)
 			k, otherK := newKeys(t), newKeys(t)
 			owner, other := pair(t, s, k), pair(t, s, otherK)
-			origin := "https://wol.hubu.wiki"
+			origin := "https://wol.example"
 			now := s.now()
 			s.now = func() time.Time { return now }
 			grant := authorize(t, s, k, owner.DeviceID, origin, 0, true)
@@ -336,7 +336,7 @@ func TestPermanentManagementLifecycle(t *testing.T) {
 			case "revoke":
 				err = s.Revoke(owner.DeviceID)
 			case "replacement":
-				authorize(t, s, k, owner.DeviceID, "https://roc.hubu.wiki", 10, false)
+				authorize(t, s, k, owner.DeviceID, "https://backup.example", 10, false)
 			case "close":
 				s.Close()
 			}
@@ -368,7 +368,7 @@ func TestPermanentAuthorizationStillBoundsTicketsAndChallenges(t *testing.T) {
 	s := state(t)
 	k := newKeys(t)
 	owner := pair(t, s, k)
-	origin := "https://wol.hubu.wiki"
+	origin := "https://wol.example"
 	now := s.now()
 	s.now = func() time.Time { return now }
 	authorize(t, s, k, owner.DeviceID, origin, 0, false)
@@ -403,7 +403,7 @@ func TestPermanentManagementRejectsAlteredSignature(t *testing.T) {
 			s := state(t)
 			k := newKeys(t)
 			owner := pair(t, s, k)
-			origin := "https://wol.hubu.wiki"
+			origin := "https://wol.example"
 			c, err := s.ManageChallenge(owner.DeviceID, origin, 0, true)
 			if err != nil {
 				t.Fatal(err)
@@ -415,7 +415,7 @@ func TestPermanentManagementRejectsAlteredSignature(t *testing.T) {
 			case "scope":
 				all = false
 			case "origin":
-				signedOrigin = "https://roc.hubu.wiki"
+				signedOrigin = "https://backup.example"
 			case "wake-key":
 				key = k.wake
 			}
@@ -432,7 +432,7 @@ func TestAnonymousOwnerPrefersFiniteDeadlineOverPermanent(t *testing.T) {
 	s := state(t)
 	k, otherK := newKeys(t), newKeys(t)
 	owner, other := pair(t, s, k), pair(t, s, otherK)
-	origin := "https://wol.hubu.wiki"
+	origin := "https://wol.example"
 	authorize(t, s, k, owner.DeviceID, origin, 0, true)
 	finite := authorize(t, s, otherK, other.DeviceID, origin, 5, true)
 	ctx, release, err := s.ProxyContext(context.Background(), "", origin)

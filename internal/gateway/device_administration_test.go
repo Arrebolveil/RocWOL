@@ -1,6 +1,8 @@
 package gateway
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -16,7 +18,7 @@ func deviceProof(t *testing.T, g *Gateway, id testIdentity, action, target strin
 	if e != nil {
 		t.Fatal(e)
 	}
-	w := request(g, "POST", "/_wol/v1/devices/challenge", id.AccessToken, "", string(payload))
+	w := request(g, "POST", "/_wol/v2/devices/challenge", id.AccessToken, "", string(payload))
 	if w.Code != 200 {
 		t.Fatalf("administration challenge: %d %s", w.Code, w.Body.String())
 	}
@@ -40,17 +42,17 @@ func TestDeviceAdministrationHTTPPrivilegeAndSafeListing(t *testing.T) {
 	g := fixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("device administration reached router") })
 	owner, other := identity(t, g), identity(t, g)
 	cookie := session(t, g, owner, 0)
-	w := request(g, "GET", "/_wol/v1/devices/access", owner.AccessToken, "", "")
+	w := request(g, "GET", "/_wol/v2/devices/access", owner.AccessToken, "", "")
 	var access map[string]any
 	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &access) != nil || len(access) != 2 || access["deviceId"] != owner.DeviceID || access["deviceAdministration"] != false {
 		t.Fatalf("own capability leaked devices or elevated caller: %d %s", w.Code, w.Body.String())
 	}
 	challenge := `{"origin":"` + testOrigin + `","action":"list","targetDeviceId":""}`
-	w = request(g, "POST", "/_wol/v1/devices/challenge", owner.AccessToken, cookie, challenge)
+	w = request(g, "POST", "/_wol/v2/devices/challenge", owner.AccessToken, cookie, challenge)
 	if w.Code != 403 {
 		t.Fatalf("wake plus LuCI credentials authorized device administration: %d", w.Code)
 	}
-	for _, path := range []string{"/_wol/v1/devices/admin", "/_wol/v1/devices/access"} {
+	for _, path := range []string{"/_wol/v2/devices/admin", "/_wol/v2/devices/access"} {
 		w = request(g, "POST", path, owner.AccessToken, cookie, `{"enabled":true}`)
 		if w.Code != 404 {
 			t.Fatalf("public API exposes capability grant: %s %d", path, w.Code)
@@ -60,10 +62,10 @@ func TestDeviceAdministrationHTTPPrivilegeAndSafeListing(t *testing.T) {
 		t.Fatal(e)
 	}
 	for _, endpoint := range []struct{ method, path, body string }{
-		{"GET", "/_wol/v1/devices/access", ""},
-		{"POST", "/_wol/v1/devices/challenge", challenge},
-		{"POST", "/_wol/v1/devices/list", `{}`},
-		{"POST", "/_wol/v1/devices/revoke", `{}`},
+		{"GET", "/_wol/v2/devices/access", ""},
+		{"POST", "/_wol/v2/devices/challenge", challenge},
+		{"POST", "/_wol/v2/devices/list", `{}`},
+		{"POST", "/_wol/v2/devices/revoke", `{}`},
 	} {
 		w = request(g, endpoint.method, endpoint.path, "", cookie, endpoint.body)
 		if w.Code != 401 {
@@ -71,12 +73,12 @@ func TestDeviceAdministrationHTTPPrivilegeAndSafeListing(t *testing.T) {
 		}
 	}
 	// Unsigned requests still fail after the administrator capability is granted.
-	w = request(g, "POST", "/_wol/v1/devices/list", owner.AccessToken, "", `{}`)
+	w = request(g, "POST", "/_wol/v2/devices/list", owner.AccessToken, "", `{}`)
 	if w.Code != 409 {
 		t.Fatalf("bearer alone listed devices: %d", w.Code)
 	}
 	proof := deviceProof(t, g, owner, "list", "")
-	w = request(g, "POST", "/_wol/v1/devices/list", owner.AccessToken, "", proof)
+	w = request(g, "POST", "/_wol/v2/devices/list", owner.AccessToken, "", proof)
 	var listing struct {
 		Devices []map[string]any `json:"devices"`
 	}
@@ -91,7 +93,7 @@ func TestDeviceAdministrationHTTPPrivilegeAndSafeListing(t *testing.T) {
 			t.Fatalf("unexpected device: %+v", row)
 		}
 	}
-	w = request(g, "POST", "/_wol/v1/devices/list", owner.AccessToken, "", proof)
+	w = request(g, "POST", "/_wol/v2/devices/list", owner.AccessToken, "", proof)
 	if w.Code != 409 {
 		t.Fatalf("HTTP signature replay accepted: %d", w.Code)
 	}
@@ -104,12 +106,12 @@ func TestDeviceAdministrationSelfRevocationReturnsReceipt(t *testing.T) {
 		t.Fatal(e)
 	}
 	proof := deviceProof(t, g, owner, "revoke", owner.DeviceID)
-	w := request(g, "POST", "/_wol/v1/devices/revoke", owner.AccessToken, "", proof)
+	w := request(g, "POST", "/_wol/v2/devices/revoke", owner.AccessToken, "", proof)
 	var result protocol.DeviceRevocation
 	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &result) != nil || !result.Current || !result.Revoked || result.DeviceID != owner.DeviceID {
 		t.Fatalf("self cancellation swallowed receipt: %d %s", w.Code, w.Body.String())
 	}
-	w = request(g, "GET", "/_wol/v1/devices/access", owner.AccessToken, "", "")
+	w = request(g, "GET", "/_wol/v2/devices/access", owner.AccessToken, "", "")
 	if w.Code != 401 {
 		t.Fatalf("revoked token retained access: %d", w.Code)
 	}
@@ -126,15 +128,15 @@ func TestDeviceAdministrationRevocationWhileReadingBody(t *testing.T) {
 	pendingProof := deviceProof(t, g, owner, "revoke", target.DeviceID)
 	proof := deviceProof(t, g, revoker, "revoke", owner.DeviceID)
 	body := &gatedBody{Reader: strings.NewReader(pendingProof), started: make(chan struct{}), release: make(chan struct{})}
-	r := httptest.NewRequest("POST", "/_wol/v1/devices/revoke", body)
-	r.Host = "wol.hubu.wiki"
+	r := httptest.NewRequest("POST", "/_wol/v2/devices/revoke", body)
+	r.Host = "wol.example"
 	r.Header.Set("Origin", testOrigin)
 	r.Header.Set("Authorization", "Bearer "+owner.AccessToken)
 	w := httptest.NewRecorder()
 	done := make(chan struct{})
 	go func() { defer close(done); g.ServeHTTP(w, r) }()
 	<-body.started
-	revoked := request(g, "POST", "/_wol/v1/devices/revoke", revoker.AccessToken, "", proof)
+	revoked := request(g, "POST", "/_wol/v2/devices/revoke", revoker.AccessToken, "", proof)
 	close(body.release)
 	<-done
 	if revoked.Code != 200 || w.Code != 401 {
@@ -168,6 +170,37 @@ func TestLocalDeviceAdministrationRequiresExplicitCapabilityChoice(t *testing.T)
 		access, e := g.Auth.DeviceAdministrationAccess(owner.DeviceID)
 		if e != nil || access.DeviceAdministration != enabled {
 			t.Fatalf("local capability did not persist: %+v %v", access, e)
+		}
+	}
+}
+
+func TestLocalDeviceListProvidesOnlyPublicKeyFingerprints(t *testing.T) {
+	g := fixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("unexpected router request") })
+	owner := identity(t, g)
+	devices, err := g.DB.Devices()
+	if err != nil || len(devices) != 1 {
+		t.Fatalf("fixture device unavailable: %v", err)
+	}
+	w := httptest.NewRecorder()
+	g.admin(w, httptest.NewRequest("GET", "/devices", nil))
+	var rows []map[string]any
+	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &rows) != nil || len(rows) != 1 {
+		t.Fatalf("local listing failed: %d %s", w.Code, w.Body.String())
+	}
+	if rows[0]["deviceId"] != owner.DeviceID {
+		t.Fatal("local listing changed device identity")
+	}
+	for field, key := range map[string]string{"wakeKeySHA256": devices[0].WakeKey, "manageKeySHA256": devices[0].ManageKey} {
+		der, err := protocol.Decode(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hash := sha256.Sum256(der)
+		if rows[0][field] != hex.EncodeToString(hash[:]) {
+			t.Fatalf("%s does not fingerprint decoded DER", field)
+		}
+		if strings.Contains(w.Body.String(), key) {
+			t.Fatal("local listing disclosed raw public key")
 		}
 	}
 }

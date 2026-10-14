@@ -28,33 +28,112 @@ func (g *Gateway) agentRequest(r *http.Request, method, path string, payload any
 	}
 	return g.client.Do(req)
 }
-func (g *Gateway) target(w http.ResponseWriter, r *http.Request, device string) {
-	status := protocol.Status{TargetID: "desktop", Reachability: "unknown"}
+
+// readTargets trusts only a validated response from the authenticated agent.
+// A successful read replaces, rather than merges, the bounded snapshot.
+func (g *Gateway) readTargets(r *http.Request) (protocol.TargetList, error) {
+	resp, err := g.agentRequest(r, "GET", "/_roc-agent/v2/targets", nil)
+	if err != nil {
+		return protocol.TargetList{}, err
+	}
+	defer drainClose(resp.Body)
+	var wire struct {
+		Targets           []protocol.TargetInfo `json:"targets"`
+		ManagementEnabled *bool                 `json:"managementEnabled"`
+	}
+	if resp.StatusCode != 200 || protocol.DecodeJSON(resp.Body, &wire, protocol.ResponseJSONLimit) != nil || wire.ManagementEnabled == nil {
+		return protocol.TargetList{}, errors.New("invalid agent target list")
+	}
+	list := protocol.TargetList{Targets: wire.Targets, ManagementEnabled: *wire.ManagementEnabled}
+	if !protocol.ValidTargetList(list) {
+		return protocol.TargetList{}, errors.New("invalid agent target list")
+	}
+	snapshot := make(map[string]protocol.TargetInfo, len(list.Targets))
+	for _, target := range list.Targets {
+		snapshot[target.TargetID] = target
+	}
+	g.targetMu.Lock()
+	g.targetSnapshot = snapshot
+	g.targetMu.Unlock()
+	list.ManagementEnabled = list.ManagementEnabled && (g.cfg.ManagementEnabled == nil || *g.cfg.ManagementEnabled)
+	return list, nil
+}
+func (g *Gateway) managementAvailable(r *http.Request) (bool, error) {
+	if g.cfg.ManagementEnabled != nil && !*g.cfg.ManagementEnabled {
+		return false, nil
+	}
+	list, err := g.readTargets(r)
+	return list.ManagementEnabled, err
+}
+func (g *Gateway) requireManagement(w http.ResponseWriter, r *http.Request) bool {
+	enabled, err := g.managementAvailable(r)
+	if err != nil {
+		protocol.Fail(w, 503, "agent_unavailable")
+		return false
+	}
+	if !enabled {
+		protocol.Fail(w, 403, "management_disabled")
+		return false
+	}
+	return true
+}
+func (g *Gateway) targets(w http.ResponseWriter, r *http.Request) {
+	list, err := g.readTargets(r)
+	if err != nil {
+		protocol.Fail(w, 503, "agent_unavailable")
+		return
+	}
+	protocol.JSON(w, 200, list)
+}
+func (g *Gateway) target(w http.ResponseWriter, r *http.Request, device, id string) {
+	if !protocol.ValidTargetID(id) {
+		protocol.Fail(w, 400, "invalid_request")
+		return
+	}
+	fresh := r.URL.RawQuery == "fresh=1"
+	if fresh && !g.admitFresh(device) {
+		w.Header().Set("Retry-After", "1")
+		protocol.Fail(w, 429, "rate_limited")
+		return
+	}
+	_, listErr := g.readTargets(r)
+	g.targetMu.RLock()
+	target, exists := g.targetSnapshot[id]
+	g.targetMu.RUnlock()
+	if !exists {
+		if listErr != nil {
+			protocol.Fail(w, 503, "agent_unavailable")
+		} else {
+			protocol.Fail(w, 404, "target_not_found")
+		}
+		return
+	}
+	status := protocol.Status{TargetID: id, Reachability: "unknown"}
 	router := "unavailable"
-	path := "/_roc-agent/v1/status"
-	if r.URL.Query().Get("fresh") == "1" {
-		if !g.admitFresh(device) {
-			w.Header().Set("Retry-After", "1")
-			protocol.Fail(w, 429, "rate_limited")
-			return
+	if listErr == nil {
+		path := "/_roc-agent/v2/targets/" + id + "/status"
+		if fresh {
+			path += "?fresh=1"
 		}
-		path += "?fresh=1"
-	}
-	resp, e := g.agentRequest(r, "GET", path, nil)
-	if e == nil {
-		defer drainClose(resp.Body)
-		var received protocol.Status
-		if resp.StatusCode == 200 && protocol.DecodeJSON(resp.Body, &received, protocol.JSONLimit) == nil && received.TargetID == "desktop" && (received.Reachability == "reachable" || received.Reachability == "unreachable" || received.Reachability == "unknown") && received.CheckedAt != nil {
-			status = received
-			router = "available"
+		resp, err := g.agentRequest(r, "GET", path, nil)
+		if err == nil {
+			defer drainClose(resp.Body)
+			var received protocol.Status
+			if resp.StatusCode == 404 {
+				protocol.Fail(w, 404, "target_not_found")
+				return
+			}
+			if resp.StatusCode == 200 && protocol.DecodeJSON(resp.Body, &received, protocol.ResponseJSONLimit) == nil && received.TargetID == id && (received.Reachability == "reachable" || received.Reachability == "unreachable" || received.Reachability == "unknown") && received.CheckedAt != nil && !received.CheckedAt.IsZero() {
+				status, router = received, "available"
+			}
 		}
 	}
-	last, e := g.DB.LastWake(device)
-	if e != nil {
+	last, err := g.DB.LastWake(device, id)
+	if err != nil {
 		protocol.Fail(w, 503, "upstream_unavailable")
 		return
 	}
-	protocol.JSON(w, 200, map[string]any{"targetId": "desktop", "name": "DESKTOP-IENBTJG", "mac": "B0:25:AA:83:C6:EF", "ip": "192.168.2.100", "router": router, "reachability": status.Reachability, "checkedAt": status.CheckedAt, "lastWake": last})
+	protocol.JSON(w, 200, map[string]any{"targetId": id, "name": target.Name, "mac": target.MAC, "ip": target.IP, "router": router, "reachability": status.Reachability, "checkedAt": status.CheckedAt, "lastWake": last})
 }
 func (g *Gateway) admitFresh(device string) bool {
 	g.freshMu.Lock()
@@ -74,13 +153,18 @@ func (g *Gateway) admitFresh(device string) bool {
 	g.freshRates[device] = now
 	return true
 }
-func (g *Gateway) wake(w http.ResponseWriter, r *http.Request, device, id string, post bool) {
+func (g *Gateway) wake(w http.ResponseWriter, r *http.Request, device, id, targetID string, post bool) {
 	g.wakeMu.Lock()
 	record, e := g.DB.Wake(id)
 	fresh := false
 	if e == nil && record.DeviceID != device {
 		g.wakeMu.Unlock()
 		protocol.Fail(w, 404, "not_found")
+		return
+	}
+	if e == nil && post && record.TargetID != targetID {
+		g.wakeMu.Unlock()
+		protocol.Fail(w, 409, "request_target_mismatch")
 		return
 	}
 	if e != nil && !errors.Is(e, store.ErrUnavailable) {
@@ -92,6 +176,26 @@ func (g *Gateway) wake(w http.ResponseWriter, r *http.Request, device, id string
 		if !post {
 			g.wakeMu.Unlock()
 			protocol.Fail(w, 404, "not_found")
+			return
+		}
+		// Existing bindings above are checked before consulting today's list.
+		// Only new requests require a current authenticated whitelist.
+		list, listErr := g.readTargets(r)
+		if listErr != nil {
+			g.wakeMu.Unlock()
+			protocol.Fail(w, 503, "agent_unavailable")
+			return
+		}
+		found := false
+		for _, target := range list.Targets {
+			if target.TargetID == targetID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			g.wakeMu.Unlock()
+			protocol.Fail(w, 404, "target_not_found")
 			return
 		}
 		now := time.Now().UTC()
@@ -112,7 +216,7 @@ func (g *Gateway) wake(w http.ResponseWriter, r *http.Request, device, id string
 			protocol.Fail(w, 429, "rate_limited")
 			return
 		}
-		record = store.WakeRecord{Wake: protocol.Wake{RequestID: id, Result: "pending"}, DeviceID: device, CreatedAt: now}
+		record = store.WakeRecord{Wake: protocol.Wake{TargetID: targetID, RequestID: id, Result: "pending"}, DeviceID: device, CreatedAt: now}
 		if e = g.DB.CreateWake(record); e != nil {
 			g.wakeMu.Unlock()
 			protocol.Fail(w, 503, "upstream_unavailable")
@@ -133,6 +237,12 @@ func (g *Gateway) wake(w http.ResponseWriter, r *http.Request, device, id string
 		}
 	case "failed":
 		status = 502
+		if record.Code == "target_not_found" {
+			status = 404
+		}
+		if record.Code == "request_target_mismatch" {
+			status = 409
+		}
 		if record.Code == "rate_limited" {
 			status = 429
 			w.Header().Set("Retry-After", "10")
@@ -146,36 +256,41 @@ func (g *Gateway) wake(w http.ResponseWriter, r *http.Request, device, id string
 	protocol.JSON(w, status, record.Wake)
 }
 func (g *Gateway) reconcile(r *http.Request, record store.WakeRecord, dispatch bool) store.WakeRecord {
-	method, path := "GET", "/_roc-agent/v1/wake/"+record.RequestID
+	method, path := "GET", "/_roc-agent/v2/wake/"+record.RequestID
 	var payload any
 	if dispatch {
 		method = "POST"
-		path = "/_roc-agent/v1/wake"
-		payload = map[string]string{"requestId": record.RequestID, "targetId": "desktop"}
+		path = "/_roc-agent/v2/wake"
+		payload = map[string]string{"requestId": record.RequestID, "targetId": record.TargetID}
 	}
-	result := protocol.Wake{RequestID: record.RequestID, Result: "unknown", Code: "outcome_unknown"}
+	unknown := protocol.Wake{TargetID: record.TargetID, RequestID: record.RequestID, Result: "unknown", Code: "outcome_unknown"}
+	result := unknown
 	resp, e := g.agentRequest(r, method, path, payload)
 	if e == nil {
 		defer drainClose(resp.Body)
 		var received protocol.Wake
-		if (resp.StatusCode == 200 || resp.StatusCode == 202 || resp.StatusCode == 502 || resp.StatusCode == 504) && protocol.DecodeJSON(resp.Body, &received, protocol.JSONLimit) == nil && received.RequestID == record.RequestID && (received.Result == "sent" || received.Result == "failed" || received.Result == "unknown" || received.Result == "pending") {
+		decoded := protocol.DecodeJSON(resp.Body, &received, protocol.ResponseJSONLimit) == nil && received.RequestID == record.RequestID && received.TargetID == record.TargetID
+		// Only a strictly matching authenticated rejection proves no execution.
+		if decoded && received.Result == "failed" && received.SentAt == nil && ((resp.StatusCode == 404 && received.Code == "target_not_found") || (resp.StatusCode == 409 && received.Code == "request_target_mismatch")) {
 			result = received
-			switch result.Result {
+		} else if decoded && (resp.StatusCode == 200 || resp.StatusCode == 202 || resp.StatusCode == 502 || resp.StatusCode == 504) {
+			switch received.Result {
 			case "sent":
-				if result.SentAt == nil {
-					result = protocol.Wake{RequestID: record.RequestID, Result: "unknown", Code: "outcome_unknown"}
-				} else {
-					result.Code = ""
+				if received.SentAt != nil && !received.SentAt.IsZero() {
+					received.Code = ""
+					result = received
 				}
 			case "failed":
-				result.Code = "wake_failed"
+				received.SentAt, received.Code = nil, "wake_failed"
+				result = received
+			case "pending":
+				received.SentAt, received.Code = nil, ""
+				result = received
 			case "unknown":
-				result.Code = "outcome_unknown"
-			default:
-				result.Code = ""
+				result = unknown
 			}
 		} else if dispatch && resp.StatusCode == 429 {
-			result = protocol.Wake{RequestID: record.RequestID, Result: "failed", Code: "rate_limited"}
+			result = protocol.Wake{TargetID: record.TargetID, RequestID: record.RequestID, Result: "failed", Code: "rate_limited"}
 		}
 	}
 	// Concurrent queries may complete out of order; never overwrite a terminal
@@ -184,7 +299,7 @@ func (g *Gateway) reconcile(r *http.Request, record store.WakeRecord, dispatch b
 	defer g.wakeMu.Unlock()
 	current, e := g.DB.Wake(record.RequestID)
 	if e != nil {
-		record.Wake = protocol.Wake{RequestID: record.RequestID, Result: "unknown", Code: "outcome_unknown"}
+		record.Wake = unknown
 		return record
 	}
 	if current.Result == "sent" || current.Result == "failed" {
@@ -196,7 +311,7 @@ func (g *Gateway) reconcile(r *http.Request, record store.WakeRecord, dispatch b
 	}
 	current.Wake = result
 	if e = g.DB.UpdateWake(current); e != nil {
-		current.Wake = protocol.Wake{RequestID: record.RequestID, Result: "unknown", Code: "outcome_unknown"}
+		current.Wake = unknown
 	}
 	return current
 }

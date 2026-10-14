@@ -62,12 +62,12 @@ fun AboutScreen(onBack: () -> Unit) {
                     AboutCard("网络唤醒") {
                         Text("版本 ${BuildConfig.VERSION_NAME}（${BuildConfig.VERSION_CODE}）", style = MaterialTheme.typography.bodyLarge)
                         Text("Android ${Build.VERSION.RELEASE} · API ${Build.VERSION.SDK_INT}", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        Text("安全地管理已配对设备并手动唤醒固定目标。", style = MaterialTheme.typography.bodyMedium)
+                        Text("按服务器隔离身份，手动选择部署端维护的电脑并唤醒。", style = MaterialTheme.typography.bodyMedium)
                     }
                 }
                 item {
                     AboutCard("客户端协议支持") {
-                        Text("pairV1 · manageV2 · device-adminV1", style = MaterialTheme.typography.bodyLarge)
+                        Text("公网 API v2 · pairV1 · manageV2 · device-adminV1", style = MaterialTheme.typography.bodyLarge)
                         Text("以上为本客户端实现的协议，不代表已检测或确认服务器正在运行的协议版本。实际可用功能以服务器响应与授权为准。", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
@@ -78,14 +78,14 @@ fun AboutScreen(onBack: () -> Unit) {
                         Text("正常功能会与所选服务器通信。连接诊断使用系统 DNS 与已认证的只读目标查询；不自动重试唤醒，也不绕过系统 VPN。", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
-                item {
+                if (BuildConfig.RELEASES_URL.isNotEmpty()) item {
                     AboutCard("手动查看更新") {
                         Text("在浏览器打开 GitHub 发布页面，自行查看版本说明与可用下载。本应用不会自动下载或安装更新，也不内置 GitHub 凭据。", style = MaterialTheme.typography.bodyMedium)
                         Text("若仓库或发布内容为私有，你需要在浏览器中使用有权限的账号登录；打开链接不保证能够访问。", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        Text(RELEASE_PAGE, style = MaterialTheme.typography.bodySmall)
+                        Text(BuildConfig.RELEASES_URL, style = MaterialTheme.typography.bodySmall)
                         OutlinedButton(onClick = {
                             val message = try {
-                                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(RELEASE_PAGE)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(BuildConfig.RELEASES_URL)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                                 null
                             } catch (_: ActivityNotFoundException) {
                                 "未找到可打开链接的浏览器，请手动访问上方发布地址。"
@@ -110,5 +110,3 @@ private fun AboutCard(title: String, content: @Composable () -> Unit) {
         }
     }
 }
-
-private const val RELEASE_PAGE = "https://github.com/Arrebolveil/RocWOL/releases"

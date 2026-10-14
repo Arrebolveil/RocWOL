@@ -1,0 +1,171 @@
+{
+  "formatVersion": 1,
+  "database": {
+    "version": 2,
+    "identityHash": "b938a7f015d7321d08942a5c4ca70439",
+    "entities": [
+      {
+        "tableName": "operation_events",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `timestampMs` INTEGER NOT NULL, `action` TEXT NOT NULL, `outcome` TEXT NOT NULL, `trigger` TEXT NOT NULL, `origin` TEXT, `requestId` TEXT, `httpStatus` INTEGER, `error` TEXT, `durationMs` INTEGER, `wakeStage` TEXT, `target` TEXT, `reachability` TEXT, `router` TEXT, `authorizationMinutes` INTEGER, `allowAllDevices` INTEGER, `scopeKey` TEXT NOT NULL, `fingerprint` TEXT NOT NULL, `occurrences` INTEGER NOT NULL DEFAULT 1, `lastTimestampMs` INTEGER NOT NULL DEFAULT 0, `profileId` TEXT, `targetId` TEXT, `routeIndex` INTEGER)",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "timestampMs",
+            "columnName": "timestampMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "action",
+            "columnName": "action",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "outcome",
+            "columnName": "outcome",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "trigger",
+            "columnName": "trigger",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "origin",
+            "columnName": "origin",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "requestId",
+            "columnName": "requestId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "httpStatus",
+            "columnName": "httpStatus",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "error",
+            "columnName": "error",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "durationMs",
+            "columnName": "durationMs",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "wakeStage",
+            "columnName": "wakeStage",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "target",
+            "columnName": "target",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "reachability",
+            "columnName": "reachability",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "router",
+            "columnName": "router",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "authorizationMinutes",
+            "columnName": "authorizationMinutes",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "allowAllDevices",
+            "columnName": "allowAllDevices",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "scopeKey",
+            "columnName": "scopeKey",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "fingerprint",
+            "columnName": "fingerprint",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "occurrences",
+            "columnName": "occurrences",
+            "affinity": "INTEGER",
+            "notNull": true,
+            "defaultValue": "1"
+          },
+          {
+            "fieldPath": "lastTimestampMs",
+            "columnName": "lastTimestampMs",
+            "affinity": "INTEGER",
+            "notNull": true,
+            "defaultValue": "0"
+          },
+          {
+            "fieldPath": "profileId",
+            "columnName": "profileId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "targetId",
+            "columnName": "targetId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "routeIndex",
+            "columnName": "routeIndex",
+            "affinity": "INTEGER"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_operation_events_timestampMs",
+            "unique": false,
+            "columnNames": [
+              "timestampMs"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_operation_events_timestampMs` ON `${TABLE_NAME}` (`timestampMs`)"
+          },
+          {
+            "name": "index_operation_events_scopeKey",
+            "unique": false,
+            "columnNames": [
+              "scopeKey"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_operation_events_scopeKey` ON `${TABLE_NAME}` (`scopeKey`)"
+          }
+        ]
+      }
+    ],
+    "setupQueries": [
+      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'b938a7f015d7321d08942a5c4ca70439')"
+    ]
+  }
+}

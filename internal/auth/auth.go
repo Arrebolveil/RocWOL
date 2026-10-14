@@ -44,6 +44,7 @@ type window struct {
 type State struct {
 	mu                        sync.Mutex
 	db                        *store.Store
+	maxDevices                int
 	challenges                map[string]challenge
 	tokens, tickets, sessions map[string]grant
 	management                map[string]managementGrant
@@ -53,8 +54,10 @@ type State struct {
 	MaxSessionTTL             time.Duration
 }
 
-func New(db *store.Store) *State {
-	return &State{db: db, challenges: map[string]challenge{}, tokens: map[string]grant{}, tickets: map[string]grant{}, sessions: map[string]grant{}, management: map[string]managementGrant{}, rates: map[string]window{}, active: map[string]map[string]context.CancelFunc{}, now: func() time.Time { return time.Now().UTC() }, MaxSessionTTL: 30 * time.Minute}
+// New retains the configured capacity; gateway configuration owns defaults and
+// validation. Store.Register independently rejects capacities outside 1–100.
+func New(db *store.Store, maxDevices int) *State {
+	return &State{db: db, maxDevices: maxDevices, challenges: map[string]challenge{}, tokens: map[string]grant{}, tickets: map[string]grant{}, sessions: map[string]grant{}, management: map[string]managementGrant{}, rates: map[string]window{}, active: map[string]map[string]context.CancelFunc{}, now: func() time.Time { return time.Now().UTC() }, MaxSessionTTL: 30 * time.Minute}
 }
 func (s *State) clean() {
 	now := s.now()
@@ -215,7 +218,7 @@ func (s *State) PairComplete(id, wakeSig, manageSig string) (protocol.Credential
 		return protocol.Credentials{}, fail(403, "forbidden")
 	}
 	d := store.Device{DeviceID: protocol.ID(), DeviceName: c.Name, WakeKey: c.Wake, ManageKey: c.Manage, CreatedAt: s.now()}
-	if e = s.db.Register(c.CodeHash, d, s.now()); e != nil {
+	if e = s.db.Register(c.CodeHash, d, s.now(), s.maxDevices); e != nil {
 		if errors.Is(e, store.ErrCapacity) {
 			return protocol.Credentials{}, fail(429, "rate_limited")
 		}
